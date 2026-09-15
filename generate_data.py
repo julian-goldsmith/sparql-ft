@@ -391,7 +391,7 @@ def check_expected_answer(question, query, rows, entities_block=None):
     # (Rows are guaranteed non-empty here — empty results are rejected
     # earlier by validate_query.) Without this, "Yes" vs ["Order of..."]
     # poisons the retry loop into trying to SELECT the literal "Yes".
-    norm_pred = prediction.strip(".! ").lower()
+    norm_pred = prediction.strip(".,;:! \t").lower()
     if norm_pred in ("yes", "y", "yeah", "yep", "true"):
         return True, ""
     if norm_pred in ("no", "n", "nope", "false"):
