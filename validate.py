@@ -15,7 +15,7 @@ Prints: parse rate, execution rate, exact-match rate.
 import argparse
 import json
 
-from yago_prompts import SYSTEM_PROMPT, PROPERTY_HINTS, strip_reasoning
+from yago_prompts import SYSTEM_PROMPT, strip_reasoning
 
 import torch
 from rdflib.plugins.sparql import prepareQuery
@@ -24,16 +24,13 @@ from peft import PeftModel
 
 MODEL_NAME = "Qwen/Qwen3-4B"        # must match the base used for training
 FUSEKI_URL = "http://192.168.8.110:3030/yago/sparql"
-def generate(model, tokenizer, question, entities, prefixes):
+def generate(model, tokenizer, question):
     # Must match the training prompt EXACTLY (yago_prompts.py is the source
-    # of truth) or eval numbers will lie about training quality.
-    user = (
-        f"Question: {question}\n\nEntities:\n{entities}\n\n"
-        f"Properties:\n{PROPERTY_HINTS}\n\nPrefixes:\n{prefixes}"
-    )
+    # of truth) or eval numbers will lie about training quality. Training
+    # user turns are the BARE question — no entities/properties/prefixes.
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": user},
+        {"role": "user", "content": question},
     ]
     inputs = tokenizer.apply_chat_template(
         messages,
@@ -78,7 +75,7 @@ def main():
     parse_ok = exec_ok = exact_ok = 0
 
     for row in rows:
-        q = generate(model, tokenizer, row["question"], row["entities"], row["prefixes"])
+        q = generate(model, tokenizer, row["question"])
         if is_parsable(q):
             parse_ok += 1
             # Optional: execute against Fuseki and compare result sets

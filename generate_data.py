@@ -598,6 +598,36 @@ def fetch_label(uri):
     return re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", tail)
 
 
+NOISY_TYPES = {
+    "http://www.w3.org/2002/07/owl#Thing",
+    "http://schema.org/Thing",
+}
+
+
+def fetch_types(uri, limit=3):
+    """rdf:type probe for the entity block. Returns up to `limit` concrete
+    class URIs (rendered by the caller via render_entity, so the LLM sees
+    stable `yago:Voice_actor`-style names it may copy into rdf:type filters
+    verbatim). Root classes like owl:Thing are filtered out."""
+    q = (
+        "PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>\n"
+        f"SELECT ?t WHERE {{ <{uri}> rdf:type ?t }} LIMIT {limit + len(NOISY_TYPES) + 5}"
+    )
+    try:
+        rows = sparql_select(q)
+    except Exception as e:
+        print(f"  [warn] type probe failed for '{uri}': {str(e)[:100]}")
+        return []
+    types = []
+    for r in rows:
+        t = r["t"]["value"]
+        if t not in NOISY_TYPES and t not in types:
+            types.append(t)
+        if len(types) >= limit:
+            break
+    return types
+
+
 def generate_question(entity_label, prop_label):
     """LLM writes a natural question involving the sampled entity+property."""
     msgs = [
@@ -628,7 +658,6 @@ def iter_questions(args):
     if args.generate_questions:
         produced = 0
         attempts = 0
-        qid_kept = 0
         max_attempts = args.generate_questions * MAX_SAMPLE_ATTEMPTS
         while produced < args.generate_questions and attempts < max_attempts:
             attempts += 1
@@ -637,14 +666,11 @@ def iter_questions(args):
                 continue
             s_label = strip_qid_suffix(fetch_label(s))
             p_label = strip_qid_suffix(fetch_label(p))
-            # Real questions almost never mention Q-IDs: an empty label here
-            # means the entity had no real name (bare Q-ID fallback). Keep only
-            # a small trickle (--qid-question-rate) so the model still learns
-            # the Q-ID resolution pattern, and resample otherwise.
+            # Q-ID questions are gone entirely: gold queries anchor on exact
+            # rdfs:label names, and a bare "Q123" entity has no usable name.
+            # Skip any sample whose label is empty after Q-ID stripping.
             if not s_label or not p_label:
-                if random.random() >= args.qid_question_rate:
-                    continue
-                qid_kept += 1
+                continue
             try:
                 q = generate_question(s_label, p_label)
             except Exception as e:
@@ -654,9 +680,6 @@ def iter_questions(args):
                 produced += 1
                 yield q, "generated"
             time.sleep(SLEEP_BETWEEN_CALLS)
-        if qid_kept:
-            print(f"[qid] kept {qid_kept} Q-ID-flavored question(s) "
-                  f"(rate {args.qid_question_rate:.0%})")
 
 
 def process_question(question, do_answer_check=True):
@@ -677,9 +700,29 @@ def process_question(question, do_answer_check=True):
     if not resolved:
         return None, "no mentions resolved to Yago entities"
 
-    entities_block = "\n".join(
-        f"- {mention} -> {render_entity(uri)}" for uri, mention in resolved.items()
-    )
+    # Entity block: canonical NAME + types only — NO opaque URIs. This block
+    # is GENERATOR SCAFFOLDING: the OpenRouter LLM sees it when writing the
+    # gold query, but it is NEVER written into the training example (the
+    # user turn is the bare question). The Q-ID suffix is stripped from the
+    # name: entities whose stored label carries a Q-ID fail the consistency
+    # gate below — by design.
+    block_lines = []
+    for uri, mention in resolved.items():
+        name = strip_qid_suffix(fetch_label(uri)) or mention
+        # Plain-question gate: the fine-tuned model sees ONLY the question,
+        # so the gold query's label anchor must be derivable from the
+        # question text. A canonical name the question doesn't contain
+        # (paraphrased/mangled spelling) would teach the model to invent
+        # name forms — reject instead.
+        if name.lower() not in question.lower():
+            return None, (f'canonical name "{name}" missing from question '
+                          f"(mention was '{mention}')")
+        types = fetch_types(uri)
+        entry = f'- "{name}"'
+        if types:
+            entry += " (types: " + ", ".join(render_entity(t) for t in types) + ")"
+        block_lines.append(entry)
+    entities_block = "\n".join(block_lines)
 
     last_error = None
     last_query = None
@@ -700,14 +743,13 @@ def process_question(question, do_answer_check=True):
             # Semantic gate: does the query actually answer the question?
             ok, feedback = check_expected_answer(question, query, rows, entities_block)
         if ok:
-            user_content = (
-                f"Question: {question}\n\nEntities:\n{entities_block}\n\n"
-                f"Properties:\n{PROPERTY_HINTS}\n\nPrefixes:\n{PREFIXES}"
-            )
+            # Plain-language user turn: ONLY the question. The Entities/
+            # Properties/Prefixes blocks exist purely for the generator LLM;
+            # the fine-tuned model must map a bare question to SPARQL.
             example = {
                 "messages": [
                     {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": user_content},
+                    {"role": "user", "content": question},
                     {"role": "assistant", "content": query},
                 ]
             }
@@ -777,9 +819,6 @@ def main():
     ap.add_argument("--reasoning-effort", default=REASONING_EFFORT,
                     choices=["low", "medium", "high"],
                     help="reasoning effort for thinking models (GLM etc.)")
-    ap.add_argument("--qid-question-rate", type=float, default=0.02,
-                    help="fraction of generated questions allowed to involve "
-                         "bare Q-ID entities (0 disables, 1 keeps all)")
     ap.add_argument("--query-log", default="data/query_log.jsonl",
                     help="JSONL log of every generated query + validation "
                          "feedback (append mode; empty string disables)")
@@ -835,8 +874,6 @@ def main():
             if random.random() < args.eval_ratio:
                 f_eval.write(json.dumps({
                     "question": question,
-                    "entities": example["messages"][1]["content"].split("Entities:\n")[1].split("\n\nProperties:")[0],
-                    "prefixes": PREFIXES,
                     "gold_query": example["messages"][2]["content"],
                 }) + "\n")
             else:

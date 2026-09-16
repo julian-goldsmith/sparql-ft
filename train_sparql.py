@@ -23,19 +23,24 @@ Usage:
     mlflow ui          # then open http://localhost:5000 to view runs
 """
 
-import torch
+import torch, os
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments
 from peft import LoraConfig, get_peft_model
-from trl import SFTTrainer, DataCollatorForCompletionOnlyLM
+from trl import SFTTrainer, SFTConfig
 import mlflow
+
+from yago_prompts import (YAGO_NS, PREFIXES, KNOWN_NS, SYSTEM_PROMPT,
+                          EXTRACT_SYSTEM, QUESTION_GEN_SYSTEM, ANSWER_SYSTEM,
+                          PROPERTY_HINTS, strip_reasoning)
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-MODEL_NAME = "Qwen/Qwen3.5-4B-Base"        # or Qwen/Qwen3-1.7B for max speed
+#MODEL_NAME = "Qwen/Qwen3.5-4B-Base"        # or Qwen/Qwen3-1.7B for max speed
+MODEL_NAME = "Qwen/Qwen3-0.6B"        # or Qwen/Qwen3-1.7B for max speed
 DATA_PATH = "data/train.jsonl"
-OUTPUT_DIR = "output/qwen3-4b-sparql"
+OUTPUT_DIR = "output/qwen3-0.6b-sparql"
 EVAL_PATH = "data/eval.jsonl"       # optional, used for post-train parse check
 
 LORA_R = 16                          # rank; 16-64. 16 is a fine start on 4B
@@ -48,7 +53,7 @@ LR = 2e-4
 
 # MLflow
 MLFLOW_TRACKING_URI = "sqlite:///mlflow.db"   # local, no server needed
-MLFLOW_EXPERIMENT = "qwen3.5-4b-sparql"
+MLFLOW_EXPERIMENT = "qwen3-0.6b-sparql"
 
 # ---------------------------------------------------------------------------
 # Load model — bf16 on XPU (Arc has native bf16; no quantization needed)
@@ -88,22 +93,23 @@ dataset = load_dataset("json", data_files=DATA_PATH, split="train")
 
 # Only compute loss on assistant turns (don't waste capacity predicting the prompt)
 response_template = "<|im_start|>assistant"
-collator = DataCollatorForCompletionOnlyLM(
-    response_template=response_template, tokenizer=tokenizer
-)
+#collator = DataCollatorForCompletionOnlyLM(
+    #response_template=response_template, tokenizer=tokenizer
+#)
 
 # ---------------------------------------------------------------------------
 # Trainer — bf16=True (Arc native), plain adamw (bitsandbytes is CUDA-only)
 # report_to="mlflow" makes HF auto-log train loss every logging step.
 # ---------------------------------------------------------------------------
-training_args = TrainingArguments(
+#FIXME training_args = TrainingArguments(
+training_args = SFTConfig(
     output_dir=OUTPUT_DIR,
     per_device_train_batch_size=BATCH_SIZE,
     gradient_accumulation_steps=GRAD_ACCUM,
     num_train_epochs=EPOCHS,
     learning_rate=LR,
     lr_scheduler_type="cosine",
-    warmup_ratio=0.03,
+    warmup_steps=30,
     logging_steps=10,
     save_strategy="epoch",
     bf16=True,                          # Intel Arc native
@@ -113,18 +119,21 @@ training_args = TrainingArguments(
     max_grad_norm=1.0,
     report_to="mlflow",
     seed=42,
+
+    # FIXME: Correct?
+    completion_only_loss=True,
 )
 
 trainer = SFTTrainer(
     model=model,
     args=training_args,
     train_dataset=dataset,
-    max_seq_length=MAX_SEQ_LEN,
-    data_collator=collator,
-    packing=False,
+    #max_seq_length=MAX_SEQ_LEN,
+    # FIXME data_collator=collator,
+    #packing=False,
     # Qwen3 has a "thinking" mode; force it OFF so the model outputs
     # plain SPARQL, not wrapped in <|thinking_start|> blocks.
-    chat_template_kwargs={"enable_thinking": False},
+    #chat_template_kwargs={"enable_thinking": False},
 )
 
 # ---------------------------------------------------------------------------
@@ -144,7 +153,7 @@ with mlflow.start_run(run_name=f"{MODEL_NAME}-r{LORA_R}") as run:
         "effective_batch": BATCH_SIZE * GRAD_ACCUM,
         "epochs": EPOCHS,
         "lr": LR,
-        "max_seq_len": MAX_SEQ_LEN,
+        #"max_seq_len": MAX_SEQ_LEN,
         "device": "xpu",
     })
 
@@ -164,14 +173,17 @@ with mlflow.start_run(run_name=f"{MODEL_NAME}-r{LORA_R}") as run:
         ok = 0
         for row in rows:
             messages = [
-                {"role": "system", "content": (
-                    "You are an expert SPARQL generator for the Yago knowledge graph. "
-                    "Output ONLY the SPARQL query."
-                )},
-                {"role": "user", "content": (
-                    f"Question: {row['question']}\n\nEntities:\n{row['entities']}"
-                    f"\n\nPrefixes:\n{row['prefixes']}"
-                )},
+                #{"role": "system", "content": (
+                    #"You are an expert SPARQL generator for the Yago knowledge graph. "
+                    #"Output ONLY the SPARQL query."
+                #)},
+                #{"role": "user", "content": (
+                    #f"Question: {row['question']}\n\nEntities:\n{row['entities']}"
+                    #f"\n\nPrefixes:\n{row['prefixes']}"
+                #)},
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": row['question']},
+                {"role": "assistant", "content": row['gold_query']},
             ]
             inputs = tokenizer.apply_chat_template(
                 messages, tokenize=True, add_generation_prompt=True,
