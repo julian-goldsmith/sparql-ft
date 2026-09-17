@@ -46,8 +46,8 @@ EVAL_PATH = "data/eval.jsonl"       # optional, used for post-train parse check
 LORA_R = 16                          # rank; 16-64. 16 is a fine start on 4B
 LORA_ALPHA = 32                      # 2x rank
 MAX_SEQ_LEN = 2048                   # bump to 4096 if you have the headroom
-BATCH_SIZE = 2                       # safe on 32GB; try 4-8
-GRAD_ACCUM = 8                       # effective batch = BATCH_SIZE * GRAD_ACCUM
+BATCH_SIZE = 16                       # safe on 32GB; try 4-8
+GRAD_ACCUM = 1                       # effective batch = BATCH_SIZE * GRAD_ACCUM
 EPOCHS = 3
 LR = 2e-4
 
@@ -172,6 +172,7 @@ with mlflow.start_run(run_name=f"{MODEL_NAME}-r{LORA_R}") as run:
         rows = [json.loads(l) for l in open(EVAL_PATH) if l.strip()][:50]
         ok = 0
         for row in rows:
+            print(row['question'])
             messages = [
                 #{"role": "system", "content": (
                     #"You are an expert SPARQL generator for the Yago knowledge graph. "
@@ -187,15 +188,16 @@ with mlflow.start_run(run_name=f"{MODEL_NAME}-r{LORA_R}") as run:
             ]
             inputs = tokenizer.apply_chat_template(
                 messages, tokenize=True, add_generation_prompt=True,
-                return_tensors="pt", chat_template_kwargs={"enable_thinking": False}
+                return_tensors="pt", return_dict=True,
+                #chat_template_kwargs={"enable_thinking": False}
             ).to("xpu")
             with torch.no_grad():
                 out = model.generate(
-                    inputs, max_new_tokens=512,
+                    **inputs, max_new_tokens=512,
                     temperature=0.01, do_sample=True, top_p=0.9,
                 )
             q = strip_reasoning(
-                tokenizer.decode(out[0][inputs.shape[1]:], skip_special_tokens=True)
+                tokenizer.decode(out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
             )
             if is_parsable(q):
                 ok += 1
