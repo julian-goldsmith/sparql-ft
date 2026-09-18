@@ -3,3 +3,5 @@ __pycache__/
 set-env.sh
 venv/
 mlflow.db
+output/
+mlruns/

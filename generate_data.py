@@ -18,6 +18,13 @@ Pipeline per question:
   7. Write valid examples to train.jsonl (messages format) and eval.jsonl
      (flat format that validate.py expects)
 
+Concurrency: all Fuseki/RDF work (entity resolution, label/type fetches, query
+validation, predicate discovery, pool harvest) runs in a pool of persistent
+worker processes fed via multiprocessing queues (--rdf-workers). Batches
+dispatch N Fuseki round trips at once so they overlap across workers. LLM
+calls stay in the main process and sequential — they're rate-limited, not
+Fuseki-bound.
+
 Requirements:
     pip install openai SPARQLWrapper rdflib
     export OPENROUTER_API_KEY=sk-or-...
@@ -34,7 +41,9 @@ Usage:
 
 import argparse
 import json
+import multiprocessing as mp
 import os
+import queue
 import random
 import re
 import sys
@@ -100,8 +109,11 @@ POOL_RING = []     # shuffled index ring so samples don't repeat until exhausted
 # OpenRouter client
 # ---------------------------------------------------------------------------
 api_key = os.environ.get("OPENROUTER_API_KEY")
-if not api_key:
+if not api_key and __name__ == "__main__":
     sys.exit("ERROR: set OPENROUTER_API_KEY (export OPENROUTER_API_KEY=sk-or-...)")
+# NOTE: no unconditional exit at import time — spawn-mode RDF worker children
+# re-import this module and must survive without the key (they never call the
+# LLM; llm_chat guards for it below).
 
 client = OpenAI(
     base_url="https://openrouter.ai/api/v1",
@@ -110,7 +122,7 @@ client = OpenAI(
         "HTTP-Referer": "https://github.com/",   # OpenRouter asks for these
         "X-Title": "yago-sparql-data-gen",
     },
-)
+) if api_key else None
 
 
 def llm_chat(messages, temperature=0.1, max_tokens=2048):
@@ -120,6 +132,8 @@ def llm_chat(messages, temperature=0.1, max_tokens=2048):
     keep max_tokens generous or the answer never gets emitted (content=None).
     Thinking effort comes from REASONING_EFFORT (default 'low'); empty
     content is treated as a retryable failure, retries get extra headroom."""
+    if client is None:
+        raise RuntimeError("OPENROUTER_API_KEY not set — LLM calls unavailable")
     for attempt in range(3):
         try:
             resp = client.chat.completions.create(
@@ -156,7 +170,9 @@ def sparql_select(query):
 
 def check_fuseki():
     try:
-        sparql_select("SELECT ?s WHERE { ?s ?p ?o } LIMIT 1")
+        wok, res = RDF.run_one("select", "SELECT ?s WHERE { ?s ?p ?o } LIMIT 1")
+        if not wok:
+            raise RuntimeError(str(res)[:200])
     except Exception as e:
         sys.exit(f"ERROR: cannot reach Fuseki at {FUSEKI_URL}: {e}")
 
@@ -502,42 +518,48 @@ def discover_predicates(limit):
     this stays cheap even on a billion-triple graph. IMPORTANT: keep `limit`
     modest — a limit larger than the real vocabulary count degrades into a
     full-graph scan (minutes+)."""
-    rows = sparql_select(f"SELECT DISTINCT ?p WHERE {{ ?s ?p ?o }} LIMIT {int(limit)}")
-    return [r["p"]["value"] for r in rows if r["p"]["value"] not in STRUCTURAL_PREDICATES]
+    wok, res = RDF.run_one(
+        "select", f"SELECT DISTINCT ?p WHERE {{ ?s ?p ?o }} LIMIT {int(limit)}")
+    if not wok:
+        sys.exit(f"ERROR: predicate discovery failed: {res}")
+    return [r["p"]["value"] for r in res if r["p"]["value"] not in STRUCTURAL_PREDICATES]
 
 
 def harvest_pool(pool_size, n_predicates, chunk):
     """One-time Fuseki harvest of (subject, predicate) pairs.
     Per predicate: subjects at offset 0 (indexed, instant) plus one random
-    bounded offset (~<=1s index walk) for variety. Cost is bounded by the
-    per-predicate index slice, never a full-graph scan."""
+    bounded offset (~<=1s index walk) for variety. All (predicate, offset)
+    queries are dispatched to the RDF pool as ONE batch, so the Fuseki round
+    trips overlap across workers. Cost is bounded by the per-predicate index
+    slice, never a full-graph scan."""
     preds = discover_predicates(n_predicates)
     if not preds:
         sys.exit("ERROR: no predicates discovered from Fuseki — is the dataset loaded?")
     random.shuffle(preds)
-    print(f"  harvesting from {len(preds)} predicates...")
-    pool, seen = [], set()
+    print(f"  harvesting from {len(preds)} predicates "
+          f"({2 * len(preds)} queries across the RDF pool)...")
+    tasks, meta = [], []
     for p in preds:
+        offsets = (0, random.randint(0, 20000) * 10)   # up to 200k into the slice
+        for off in offsets:
+            tasks.append(("select",
+                          f"SELECT ?s WHERE {{ ?s <{p}> ?o }} LIMIT {chunk} OFFSET {off}"))
+            meta.append((p, off))
+    pool, seen = [], set()
+    for (p, off), (wok, rows) in zip(meta, RDF.run_batch(tasks)):
         if len(pool) >= pool_size:
             break
-        offsets = [0, random.randint(0, 20000) * 10]   # up to 200k into the slice
-        for off in offsets:
-            if len(pool) >= pool_size:
-                break
-            q = f"SELECT ?s WHERE {{ ?s <{p}> ?o }} LIMIT {chunk} OFFSET {off}"
-            try:
-                rows = sparql_select(q)
-            except Exception as e:
-                print(f"  [warn] harvest failed for {p} @+{off}: {str(e)[:100]}")
+        if not wok:
+            print(f"  [warn] harvest failed for {p} @+{off}: {str(rows)[:100]}")
+            continue
+        for r in rows:
+            s = r["s"]["value"]
+            if not s.startswith(YAGO_NS):
                 continue
-            for r in rows:
-                s = r["s"]["value"]
-                if not s.startswith(YAGO_NS):
-                    continue
-                key = (s, p)
-                if key not in seen:
-                    seen.add(key)
-                    pool.append(key)
+            key = (s, p)
+            if key not in seen:
+                seen.add(key)
+                pool.append(key)
     return pool
 
 
@@ -628,6 +650,138 @@ def fetch_types(uri, limit=3):
     return types
 
 
+# ---------------------------------------------------------------------------
+# RDF worker pool (multiprocessing + queues)
+# ---------------------------------------------------------------------------
+# Every Fuseki/rdflib operation (entity resolution, label/type fetches, query
+# validation, predicate discovery, pool harvest) runs in persistent worker
+# processes. The main process pushes (id, kind, payload) tasks onto a shared
+# queue and drains a result queue, so Fuseki round trips overlap across
+# workers while the LLM calls (rate-limited) stay sequential in the main
+# process. --rdf-workers 0 falls back to InlineRDFPool (single process).
+#
+# Worker results are (ok, payload): ok=False means the task function raised,
+# with payload = "ExceptionType: message". Callers turn that into the same
+# warn/skip behavior the old inline code had.
+
+RDF = None   # set in main(): RDFPool or InlineRDFPool
+
+RDF_TASKS = {
+    "select": sparql_select,      # raw SPARQL -> bindings (raises on error)
+    "resolve": resolve_entity,    # mention -> URI or None
+    "label": fetch_label,         # URI -> label string (has internal fallback)
+    "types": fetch_types,         # URI -> [type URIs]
+    "validate": validate_query,   # query -> (ok, feedback, rows)
+}
+
+
+def rdf_worker(task_q, result_q):
+    """Persistent worker: pull tasks off the queue, run the matching RDF
+    function, push (id, ok, payload) back. kind='init' configures per-process
+    globals; a None payload is the shutdown sentinel."""
+    global FUSEKI_URL, QUERY_TIMEOUT
+    while True:
+        task = task_q.get()
+        if task is None:
+            break
+        tid, kind, payload = task
+        if kind == "init":
+            FUSEKI_URL = payload["fuseki"]
+            QUERY_TIMEOUT = payload["timeout"]
+            result_q.put((tid, True, None))
+            continue
+        try:
+            result_q.put((tid, True, RDF_TASKS[kind](payload)))
+        except Exception as e:
+            result_q.put((tid, False, f"{type(e).__name__}: {e}"))
+
+
+class InlineRDFPool:
+    """Single-process fallback (--rdf-workers 0): tasks run in-process, same
+    interface as RDFPool."""
+
+    def start(self):
+        pass
+
+    def close(self):
+        pass
+
+    def run_batch(self, tasks):
+        out = []
+        for kind, payload in tasks:
+            try:
+                out.append((True, RDF_TASKS[kind](payload)))
+            except Exception as e:
+                out.append((False, f"{type(e).__name__}: {e}"))
+        return out
+
+    def run_one(self, kind, payload):
+        return self.run_batch([(kind, payload)])[0]
+
+
+class RDFPool:
+    """Persistent worker processes with explicit task/result queues."""
+
+    GET_TIMEOUT = 900   # seconds; pool silent this long => a worker died
+
+    def __init__(self, workers):
+        ctx = mp.get_context("spawn")   # portable; no forked-state surprises
+        self.n = workers
+        self.task_q = ctx.Queue()
+        self.result_q = ctx.Queue()
+        self.procs = [
+            ctx.Process(target=rdf_worker, args=(self.task_q, self.result_q),
+                        daemon=True)
+            for _ in range(workers)
+        ]
+        self._tid = 0
+
+    def start(self):
+        for p in self.procs:
+            p.start()
+        for _ in self.procs:
+            self._send("init", {"fuseki": FUSEKI_URL, "timeout": QUERY_TIMEOUT})
+        self._collect(len(self.procs))
+
+    def _send(self, kind, payload):
+        self._tid += 1
+        self.task_q.put((self._tid, kind, payload))
+        return self._tid
+
+    def _collect(self, n):
+        got = {}
+        for _ in range(n):
+            try:
+                tid, ok, payload = self.result_q.get(timeout=self.GET_TIMEOUT)
+            except queue.Empty:
+                raise RuntimeError("RDF worker pool stopped answering — did a worker die?")
+            got[tid] = (ok, payload)
+        return got
+
+    def run_batch(self, tasks):
+        """Submit [(kind, payload), ...]; results come back in submission
+        order as [(ok, payload), ...]. This is where the concurrency happens:
+        len(tasks) Fuseki round trips overlap across the worker pool."""
+        tids = [self._send(kind, payload) for kind, payload in tasks]
+        got = self._collect(len(tids))
+        return [got[t] for t in tids]
+
+    def run_one(self, kind, payload):
+        return self.run_batch([(kind, payload)])[0]
+
+    def close(self):
+        for _ in self.procs:
+            try:
+                self.task_q.put(None)
+            except Exception:
+                pass
+        for p in self.procs:
+            p.join(timeout=10)
+        for p in self.procs:
+            if p.is_alive():
+                p.terminate()
+
+
 def generate_question(entity_label, prop_label):
     """LLM writes a natural question involving the sampled entity+property."""
     msgs = [
@@ -664,8 +818,9 @@ def iter_questions(args):
             s, p = sample_triple()
             if not s or not p:
                 continue
-            s_label = strip_qid_suffix(fetch_label(s))
-            p_label = strip_qid_suffix(fetch_label(p))
+            (s_ok, s_raw), (p_ok, p_raw) = RDF.run_batch([("label", s), ("label", p)])
+            s_label = strip_qid_suffix(s_raw or "") if s_ok else ""
+            p_label = strip_qid_suffix(p_raw or "") if p_ok else ""
             # Q-ID questions are gone entirely: gold queries anchor on exact
             # rdfs:label names, and a bare "Q123" entity has no usable name.
             # Skip any sample whose label is empty after Q-ID stripping.
@@ -688,10 +843,14 @@ def process_question(question, do_answer_check=True):
     if not mentions:
         return None, "no entity mentions extracted"
 
-    # Resolve mentions -> URIs, dedupe by URI (keep first mention)
+    # Resolve mentions -> URIs — all mentions dispatched to the RDF pool in
+    # ONE batch, so their Fuseki lookups overlap instead of running serially.
+    # Results arrive in submission order; dedupe by URI (keep first mention).
     resolved = {}
-    for m in mentions:
-        uri = resolve_entity(m)
+    for m, (wok, uri) in zip(mentions, RDF.run_batch([("resolve", m) for m in mentions])):
+        if not wok:
+            print(f"  [warn] resolution of '{m}' failed: {str(uri)[:100]}")
+            continue
         if uri and uri not in resolved:
             resolved[uri] = m
         elif not uri:
@@ -706,9 +865,16 @@ def process_question(question, do_answer_check=True):
     # user turn is the bare question). The Q-ID suffix is stripped from the
     # name: entities whose stored label carries a Q-ID fail the consistency
     # gate below — by design.
+    # Labels + types for every resolved URI — one batched pass through the
+    # RDF pool (2×len(uris) Fuseki queries overlapping across workers).
+    uris = list(resolved)
+    ent = RDF.run_batch([("label", u) for u in uris] + [("types", u) for u in uris])
+    k = len(uris)
     block_lines = []
-    for uri, mention in resolved.items():
-        name = strip_qid_suffix(fetch_label(uri)) or mention
+    for i, (uri, mention) in enumerate(resolved.items()):
+        lab_ok, lab = ent[i]
+        typ_ok, typs = ent[k + i]
+        name = strip_qid_suffix(lab if lab_ok else "") or mention
         # Plain-question gate: the fine-tuned model sees ONLY the question,
         # so the gold query's label anchor must be derivable from the
         # question text. A canonical name the question doesn't contain
@@ -717,7 +883,7 @@ def process_question(question, do_answer_check=True):
         if name.lower() not in question.lower():
             return None, (f'canonical name "{name}" missing from question '
                           f"(mention was '{mention}')")
-        types = fetch_types(uri)
+        types = typs if typ_ok else []
         entry = f'- "{name}"'
         if types:
             entry += " (types: " + ", ".join(render_entity(t) for t in types) + ")"
@@ -731,7 +897,11 @@ def process_question(question, do_answer_check=True):
         query = generate_sparql(question, entities_block, error=last_error,
                                 attempt=attempt, prev_query=last_query,
                                 prev_rows=last_rows)
-        ok, feedback, rows = validate_query(query)
+        wok, res = RDF.run_one("validate", query)
+        if wok:
+            ok, feedback, rows = res
+        else:
+            ok, feedback, rows = False, f"validation error: {res}", None
         log_event({
             "type": "validation",
             "question": question,
@@ -781,7 +951,7 @@ def load_questions(path):
 
 
 def main():
-    global MODEL, FUSEKI_URL, MAX_TRIES, SLEEP_BETWEEN_CALLS, QUERY_TIMEOUT, REASONING_EFFORT, QUERY_LOG
+    global MODEL, FUSEKI_URL, MAX_TRIES, SLEEP_BETWEEN_CALLS, QUERY_TIMEOUT, REASONING_EFFORT, QUERY_LOG, RDF
 
     ap = argparse.ArgumentParser(description="Generate Text2SPARQL training data for Yago")
     ap.add_argument("--questions", default=None,
@@ -819,6 +989,10 @@ def main():
     ap.add_argument("--reasoning-effort", default=REASONING_EFFORT,
                     choices=["low", "medium", "high"],
                     help="reasoning effort for thinking models (GLM etc.)")
+    ap.add_argument("--rdf-workers", type=int, default=4,
+                    help="worker processes for Fuseki/rdflib work — entity "
+                         "resolution, label/type fetches, validation, and "
+                         "pool harvest run concurrently via queues (0 = inline)")
     ap.add_argument("--query-log", default="data/query_log.jsonl",
                     help="JSONL log of every generated query + validation "
                          "feedback (append mode; empty string disables)")
@@ -835,6 +1009,18 @@ def main():
         sys.exit("ERROR: provide --questions FILE and/or --generate-questions N")
 
     random.seed(SEED)
+
+    if args.rdf_workers > 0:
+        try:
+            RDF = RDFPool(args.rdf_workers)
+            RDF.start()
+            print(f"RDF worker pool: {args.rdf_workers} processes")
+        except Exception as e:
+            print(f"[warn] RDF worker pool failed to start ({e}); running RDF inline")
+            RDF = InlineRDFPool()
+    else:
+        RDF = InlineRDFPool()
+
     check_fuseki()
     if args.generate_questions:
         ensure_pool(args)
@@ -848,7 +1034,8 @@ def main():
         QUERY_LOG = open(args.query_log, "a")
         print(f"Logging queries to {args.query_log}")
 
-    print(f"Processing with {MODEL} (max {MAX_TRIES} tries each)")
+    print(f"Processing with {MODEL} (max {MAX_TRIES} tries each, "
+          f"{args.rdf_workers} RDF workers)")
     print(f"~{1 + 2 * MAX_TRIES} LLM calls per question "
           f"(1 extract + up to {MAX_TRIES} generate + up to {MAX_TRIES} answer-predict)\n")
 
@@ -891,6 +1078,8 @@ def main():
             f_questions.close()
         if QUERY_LOG is not None:
             QUERY_LOG.close()
+        if RDF is not None:
+            RDF.close()
 
     print("=" * 50)
     print(f"ok:        {stats['ok']}")
