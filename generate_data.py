@@ -21,6 +21,14 @@ Pipeline per question:
   8. Write valid examples to train.jsonl (messages format) and eval.jsonl
      (flat format that validate.py expects)
 
+Concurrency: a pool of --workers threads runs the full per-question pipeline
+(process_question) concurrently, so one question's Fuseki round trips overlap
+with another's LLM calls — the two things that dominate wall-clock time. The
+main thread feeds questions into a task queue, drains a result queue, and is
+the single writer of all output files. Question sourcing (--questions file /
+inline generation) stays sequential in the main thread; per-question work is
+I/O-bound HTTP, so threads beat processes (no pickling, no spawn re-import).
+
 Requirements:
     pip install openai SPARQLWrapper rdflib
     export OPENROUTER_API_KEY=sk-or-...
@@ -32,16 +40,19 @@ Usage:
     # Questions are generated INLINE (one per iteration). (subject, predicate)
     # pairs come from a LOCAL POOL harvested from Fuseki once and cached to
     # data/entity_pool.json — sampling is O(1) per question, never a graph scan.
-    # Add --no-answer-check to skip the answer gate and --no-results-check
-    # to skip the relevance judge (faster, weaker).
+    # # Add --no-answer-check to skip the answer gate and --no-results-check
+    # to skip the relevance judge (faster, weaker). --workers N runs N
+    # questions concurrently (thread pool).
 """
 
 import argparse
 import json
 import os
+import queue
 import random
 import re
 import sys
+import threading
 import time
 import urllib.parse
 
@@ -85,15 +96,17 @@ STRUCTURAL_PREDICATES = {
 MAX_SAMPLE_ATTEMPTS = 5   # tries to find a usable triple before giving up on one question
 
 QUERY_LOG = None   # file handle for the JSONL query log (opened in main)
+LOG_LOCK = threading.Lock()   # workers log concurrently, main thread doesn't
 
 
 def log_event(event):
     """Append one JSON line to the query log (if enabled). Flushed per line
-    so the file can be tailed while the run is live."""
+    so the file can be tailed while the run is live. Thread-safe."""
     if QUERY_LOG is not None:
         event["ts"] = time.strftime("%H:%M:%S")
-        QUERY_LOG.write(json.dumps(event) + "\n")
-        QUERY_LOG.flush()
+        with LOG_LOCK:
+            QUERY_LOG.write(json.dumps(event) + "\n")
+            QUERY_LOG.flush()
 
 # Global runtime config (set from CLI args in main)
 MODEL = DEFAULT_MODEL
@@ -726,8 +739,12 @@ def iter_questions(args):
             time.sleep(SLEEP_BETWEEN_CALLS)
 
 
-def process_question(question, do_answer_check=True, do_results_check=True):
-    """Returns (example_or_None, status_string)."""
+def process_question(question, do_answer_check=True, do_results_check=True,
+                     tag=""):
+    """Full per-question pipeline. Returns (example_or_None, status_string).
+    Thread-safe: reads only module globals (set before workers start) and
+    logs under LOG_LOCK. `tag` prefixes progress prints so concurrent
+    workers stay readable."""
     mentions = extract_mentions(question)
     if not mentions:
         return None, "no entity mentions extracted"
@@ -738,12 +755,12 @@ def process_question(question, do_answer_check=True, do_results_check=True):
         try:
             uri = resolve_entity(m)
         except Exception as e:
-            print(f"  [warn] resolution of '{m}' failed: {str(e)[:100]}")
+            print(f"{tag}[warn] resolution of '{m}' failed: {str(e)[:100]}")
             continue
         if uri and uri not in resolved:
             resolved[uri] = m
         elif not uri:
-            print(f"  [warn] could not resolve '{m}'")
+            print(f"{tag}[warn] could not resolve '{m}'")
 
     if not resolved:
         return None, "no mentions resolved to Yago entities"
@@ -767,7 +784,7 @@ def process_question(question, do_answer_check=True, do_results_check=True):
         if name.lower() not in question.lower():
             return None, (f'canonical name "{name}" missing from question '
                           f"(mention was '{mention}')")
-        types = typs if typ_ok else []
+        types = typs or []   # fetch_types returns [] on failure
         entry = f'- "{name}"'
         if types:
             entry += " (types: " + ", ".join(render_entity(t) for t in types) + ")"
@@ -815,10 +832,42 @@ def process_question(question, do_answer_check=True, do_results_check=True):
         last_error = feedback
         last_query = query
         last_rows = rows or None   # [] on empty results -> no preview to show
-        print(f"  [attempt {attempt}/{MAX_TRIES}] rejected: {feedback[:120]}")
+        print(f"{tag}[attempt {attempt}/{MAX_TRIES}] rejected: {feedback[:120]}")
         time.sleep(SLEEP_BETWEEN_CALLS)
 
     return None, f"failed after {MAX_TRIES} attempts: {last_error}"
+
+
+# ---------------------------------------------------------------------------
+# Question worker pool
+# ---------------------------------------------------------------------------
+# Concurrency lives ACROSS questions: N daemon threads each run the full
+# process_question pipeline (LLM calls + Fuseki validation), so one
+# question's Fuseki round trip overlaps with another's LLM call. The main
+# thread is the single writer of all output files; results flow back through
+# result_q. Threads rather than processes: every call in the pipeline is
+# HTTP I/O (OpenRouter, Fuseki), so the GIL is never the bottleneck — and
+# threads need no pickling, no spawn re-import, and share module globals.
+
+def question_worker(task_q, result_q, do_answer_check, do_results_check):
+    """Pull (idx, question, source) tasks off the queue, run the pipeline,
+    push (idx, question, example, status) to the result queue. A None task
+    is the shutdown sentinel."""
+    while True:
+        task = task_q.get()
+        if task is None:
+            return
+        idx, question, source = task
+        try:
+            example, status = process_question(
+                question,
+                do_answer_check=do_answer_check,
+                do_results_check=do_results_check,
+                tag=f"[{idx}] ",
+            )
+        except Exception as e:
+            example, status = None, f"worker error: {type(e).__name__}: {str(e)[:150]}"
+        result_q.put((idx, question, example, status))
 
 
 # ---------------------------------------------------------------------------
@@ -859,6 +908,9 @@ def main():
     ap.add_argument("--eval-ratio", type=float, default=EVAL_RATIO)
     ap.add_argument("--limit", type=int, default=0, help="max questions to process (0 = all)")
     ap.add_argument("--sleep", type=float, default=SLEEP_BETWEEN_CALLS)
+    ap.add_argument("--workers", type=int, default=4,
+                    help="questions processed concurrently (thread pool running "
+                         "the full per-question pipeline)")
     ap.add_argument("--no-answer-check", action="store_true",
                     help="skip the expected-answer verification (faster, weaker filter)")
     ap.add_argument("--no-results-check", action="store_true",
@@ -918,47 +970,85 @@ def main():
         QUERY_LOG = open(args.query_log, "a")
         print(f"Logging queries to {args.query_log}")
 
-    print(f"Processing with {MODEL} (max {MAX_TRIES} tries each)")
+    print(f"Processing with {MODEL} (max {MAX_TRIES} tries each, "
+          f"{args.workers} concurrent workers)")
     print(f"~{1 + 3 * MAX_TRIES} LLM calls per question "
           f"(1 extract + up to {MAX_TRIES} generate + up to {MAX_TRIES} "
           f"answer-predict + up to {MAX_TRIES} results-judge)\n")
 
+    # Worker pool: N threads run process_question; the main thread feeds the
+    # task queue, drains the result queue, and writes every output file.
+    task_q = queue.Queue()
+    result_q = queue.Queue()
+    workers = [
+        threading.Thread(
+            target=question_worker,
+            args=(task_q, result_q,
+                  not args.no_answer_check, not args.no_results_check),
+            daemon=True,
+        )
+        for _ in range(max(1, args.workers))
+    ]
+    for w in workers:
+        w.start()
+
     stats = {"ok": 0, "failed": 0, "skipped": 0, "generated": 0}
-    processed = 0
-    try:
-        for question, source in iter_questions(args):
-            if args.limit and processed >= args.limit:
-                break
-            processed += 1
-            if source == "generated":
-                stats["generated"] += 1
-            print(f"[{processed}] ({source}) {question[:80]}")
-            if f_questions:
-                f_questions.write(question + "\n")
-            example, status = process_question(
-                question,
-                do_answer_check=not args.no_answer_check,
-                do_results_check=not args.no_results_check,
-            )
-            if example is None:
-                stats["skipped" if "no " in status else "failed"] += 1
-                f_failed.write(json.dumps({"question": question, "reason": status}) + "\n")
-                print(f"  -> {status}\n")
-                continue
-            line = json.dumps(example)
-            if random.random() < args.eval_ratio:
-                f_eval.write(json.dumps({
-                    "question": question,
-                    "gold_query": example["messages"][2]["content"],
-                }) + "\n")
-            else:
-                f_train.write(line + "\n")
+    submitted = 0
+    pending = 0          # submitted but not yet finished
+    exhausted = False
+
+    def write_result(idx, question, example, status):
+        """Main thread is the single writer of all output files."""
+        if example is None:
+            stats["skipped" if "no " in status else "failed"] += 1
+            f_failed.write(json.dumps({"question": question, "reason": status}) + "\n")
+        elif random.random() < args.eval_ratio:
+            f_eval.write(json.dumps({
+                "question": question,
+                "gold_query": example["messages"][2]["content"],
+            }) + "\n")
             stats["ok"] += 1
-            print(f"  -> {status}\n")
-            time.sleep(args.sleep)
+        else:
+            f_train.write(json.dumps(example) + "\n")
+            stats["ok"] += 1
+        print(f"[{idx}] -> {status}\n")
+
+    questions = iter_questions(args)
+    try:
+        while True:
+            # Keep ~2 tasks per worker in flight: bounded lookahead, so the
+            # task queue can't run away from the results (question generation
+            # would otherwise race ahead of processing).
+            while not exhausted and pending < args.workers * 2:
+                if args.limit and submitted >= args.limit:
+                    exhausted = True
+                    break
+                try:
+                    question, source = next(questions)
+                except StopIteration:
+                    exhausted = True
+                    break
+                submitted += 1
+                if source == "generated":
+                    stats["generated"] += 1
+                print(f"[{submitted}] ({source}) {question[:80]}")
+                if f_questions:
+                    f_questions.write(question + "\n")
+                task_q.put((submitted, question, source))
+                pending += 1
+
+            if pending == 0:
+                break
+            idx, question, example, status = result_q.get()
+            pending -= 1
+            write_result(idx, question, example, status)
     except KeyboardInterrupt:
         print("\nInterrupted — progress saved so far.")
     finally:
+        for _ in workers:
+            task_q.put(None)   # shutdown sentinel; daemon threads die at exit anyway
+        for w in workers:
+            w.join(timeout=5)
         f_train.close()
         f_eval.close()
         f_failed.close()
