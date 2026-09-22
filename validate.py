@@ -252,7 +252,7 @@ def main():
             for rec in records:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
         mlflow.log_artifact(pred_path, artifact_path="eval")
-        #os.remove(pred_path)
+        os.remove(pred_path)
 
     print(f"parse rate:   {parse_ok}/{n} ({100*parse_rate:.1f}%)")
     print(f"exact rate:   {exact_ok}/{n} ({100*exact_rate:.1f}%)")

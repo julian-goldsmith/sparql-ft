@@ -91,6 +91,23 @@ ANSWER_SYSTEM = (
     "sure, say 'UNKNOWN'. Do not explain."
 )
 
+RESULTS_SYSTEM = (
+    "You are a strict quality judge for SPARQL training data. You are given a "
+    "natural-language question, the SPARQL query written for it, and the rows "
+    "the query actually returned from the knowledge graph. Decide whether the "
+    "query and its results answer THAT question.\n"
+    "Verdicts:\n"
+    '- "answer": the query reads the property/fact the question asks about '
+    "AND the rows contain that fact. Extra variants (other languages, extra "
+    "rows, list values) are fine.\n"
+    '- "wrong": the query reads the wrong property (e.g. deathDate when the '
+    "question asks for birthDate, actor when it asks for director), the rows "
+    "are about a different entity than the question names, or the results "
+    "plainly do not answer the question.\n"
+    '- "unsure": you cannot tell from the question, query, and rows alone.\n'
+    'Reply with ONLY JSON: {"verdict": "answer|wrong|unsure", "reason": "short"}'
+)
+
 # Properties seen in the Yago4 graph (schema.org vocabulary) + the two
 # structural predicates every query needs. Grounds property choice instead
 # of letting the model guess property names.

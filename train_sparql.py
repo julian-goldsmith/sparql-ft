@@ -63,6 +63,7 @@ model = AutoModelForCausalLM.from_pretrained(
 ).to("xpu")
 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+tokenizer_no_pad = AutoTokenizer.from_pretrained(MODEL_NAME, add_bos_token=True)
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 
@@ -117,7 +118,7 @@ training_args = SFTConfig(
     gradient_checkpointing=True,
     optim="adamw_torch",                # NOT paged_adamw_8bit (CUDA-only)
     max_grad_norm=1.0,
-    report_to="mlflow",
+    #report_to="mlflow",                # Logging is instead done through mlflow.peft.autolog()
     seed=42,
 
     # FIXME: Correct?
@@ -162,7 +163,10 @@ with mlflow.start_run(run_name=f"{MODEL_NAME}-r{LORA_R}") as run:
 
     # Save adapter, then log it as an artifact
     trainer.save_model(OUTPUT_DIR)
-    mlflow.log_artifacts(OUTPUT_DIR, artifact_path="adapter")
+    #mlflow.log_artifacts(OUTPUT_DIR, artifact_path="adapter")
+    #mlflow.transformers.log_model(transformers_model=OUTPUT_DIR, name="adapter")
+    mlflow.transformers.log_model(transformers_model={"model": trainer.model, "tokenizer": tokenizer_no_pad}, name="model", save_pretrained=False)
+    mlflow.log_artifact(__file__, artifact_path="code")
 
     # Optional: quick post-train parse-rate check on a small eval set
     if EVAL_PATH and os.path.exists(EVAL_PATH):
@@ -184,7 +188,7 @@ with mlflow.start_run(run_name=f"{MODEL_NAME}-r{LORA_R}") as run:
                 #)},
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": row['question']},
-                {"role": "assistant", "content": row['gold_query']},
+                #{"role": "assistant", "content": row['gold_query']},
             ]
             inputs = tokenizer.apply_chat_template(
                 messages, tokenize=True, add_generation_prompt=True,
@@ -204,8 +208,6 @@ with mlflow.start_run(run_name=f"{MODEL_NAME}-r{LORA_R}") as run:
         parse_rate = ok / len(rows)
         mlflow.log_metric("parse_rate", parse_rate)
         print(f"Post-train parse rate on {len(rows)} eval rows: {parse_rate:.1%}")
-
-    mlflow.log_artifact(__file__, artifact_path="code")
 
 print(f"Done. Run logged to MLflow ({MLFLOW_TRACKING_URI}). Adapter saved to {OUTPUT_DIR}")
 print(f"View with: mlflow ui")

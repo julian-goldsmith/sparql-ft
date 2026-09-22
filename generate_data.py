@@ -14,8 +14,11 @@ Pipeline per question:
   5. Expected-answer check: LLM predicts the answer from the question alone,
      and the prediction must appear in the query's actual result set
      (semantic correctness gate — catches wrong-property/wrong-entity queries)
-  6. Up to MAX_TRIES attempts, feeding the rejection reason back to the LLM
-  7. Write valid examples to train.jsonl (messages format) and eval.jsonl
+  6. Results-relevance judge: LLM sees question + query + ACTUAL result rows
+     and rejects when they don't answer the question (backstop for the
+     answer gate's UNKNOWN-accept and lenient substring matches)
+  7. Up to MAX_TRIES attempts, feeding the rejection reason back to the LLM
+  8. Write valid examples to train.jsonl (messages format) and eval.jsonl
      (flat format that validate.py expects)
 
 Concurrency: all Fuseki/RDF work (entity resolution, label/type fetches, query
@@ -36,7 +39,8 @@ Usage:
     # Questions are generated INLINE (one per iteration). (subject, predicate)
     # pairs come from a LOCAL POOL harvested from Fuseki once and cached to
     # data/entity_pool.json — sampling is O(1) per question, never a graph scan.
-    # Add --no-answer-check to skip the semantic gate (faster, weaker).
+    # Add --no-answer-check to skip the answer gate and --no-results-check
+    # to skip the relevance judge (faster, weaker).
 """
 
 import argparse
@@ -52,7 +56,7 @@ import urllib.parse
 
 from yago_prompts import (YAGO_NS, PREFIXES, KNOWN_NS, SYSTEM_PROMPT,
                           EXTRACT_SYSTEM, QUESTION_GEN_SYSTEM, ANSWER_SYSTEM,
-                          PROPERTY_HINTS, strip_reasoning)
+                          RESULTS_SYSTEM, PROPERTY_HINTS, strip_reasoning)
 
 from openai import OpenAI
 from rdflib.plugins.sparql import prepareQuery
@@ -446,6 +450,44 @@ def check_expected_answer(question, query, rows, entities_block=None):
     )
 
 
+def check_results_relevant(question, query, rows):
+    """Results-relevance judge — backstop for check_expected_answer's blind
+    spots. The expected-answer gate trusts the predictor: an UNKNOWN
+    prediction is ACCEPTED unverified, and lenient substring matches can pass
+    by accident, so a gold query whose rows answer a different question can
+    survive. This judge sees the question, the query, and the ACTUAL rows and
+    rejects when they don't line up (wrong property, wrong entity).
+    'unsure' accepts: same accept-not-reject philosophy as UNKNOWN above, and
+    it keeps genuinely ambiguous questions from burning the retry budget.
+    Only called with non-empty rows (validate_query rejects empties first)."""
+    user = (
+        f"Question: {question}\n\nQuery:\n{query}\n\n"
+        f"Result rows:\n{rows_preview(rows, limit=8)}"
+    )
+    msgs = [
+        {"role": "system", "content": RESULTS_SYSTEM},
+        {"role": "user", "content": user},
+    ]
+    raw = strip_reasoning(llm_chat(msgs, temperature=0.0, max_tokens=512))
+    m = re.search(r"\{.*\}", raw, re.DOTALL)
+    if not m:
+        return True, ""   # unparseable judge output -> don't reject on a judge malfunction
+    try:
+        verdict = json.loads(m.group(0))
+    except json.JSONDecodeError:
+        return True, ""
+    v = str(verdict.get("verdict", "unsure")).strip().lower()
+    reason = str(verdict.get("reason", ""))[:300]
+    log_event({"type": "results_judge", "question": question,
+               "verdict": v, "reason": reason})
+    if v == "wrong":
+        return False, (
+            f"Results do not answer the question: {reason}. Check that the "
+            "property and pattern match what the question actually asks for."
+        )
+    return True, ""       # "answer" and "unsure" both pass
+
+
 # ---------------------------------------------------------------------------
 # Per-question pipeline
 # ---------------------------------------------------------------------------
@@ -837,7 +879,7 @@ def iter_questions(args):
             time.sleep(SLEEP_BETWEEN_CALLS)
 
 
-def process_question(question, do_answer_check=True):
+def process_question(question, do_answer_check=True, do_results_check=True):
     """Returns (example_or_None, status_string)."""
     mentions = extract_mentions(question)
     if not mentions:
@@ -912,6 +954,11 @@ def process_question(question, do_answer_check=True):
         if ok and do_answer_check:
             # Semantic gate: does the query actually answer the question?
             ok, feedback = check_expected_answer(question, query, rows, entities_block)
+        if ok and do_results_check:
+            # Relevance gate: judge sees question + query + ACTUAL rows, so it
+            # catches wrong-data gold queries the answer gate let through
+            # (UNKNOWN predictions are accepted unverified there).
+            ok, feedback = check_results_relevant(question, query, rows)
         if ok:
             # Plain-language user turn: ONLY the question. The Entities/
             # Properties/Prefixes blocks exist purely for the generator LLM;
@@ -973,6 +1020,8 @@ def main():
     ap.add_argument("--sleep", type=float, default=SLEEP_BETWEEN_CALLS)
     ap.add_argument("--no-answer-check", action="store_true",
                     help="skip the expected-answer verification (faster, weaker filter)")
+    ap.add_argument("--no-results-check", action="store_true",
+                    help="skip the results-relevance judge (faster, weaker filter)")
     ap.add_argument("--pool-file", default="data/entity_pool.json",
                     help="cache file for the harvested (subject, predicate) pool")
     ap.add_argument("--pool-size", type=int, default=4000,
@@ -1036,8 +1085,9 @@ def main():
 
     print(f"Processing with {MODEL} (max {MAX_TRIES} tries each, "
           f"{args.rdf_workers} RDF workers)")
-    print(f"~{1 + 2 * MAX_TRIES} LLM calls per question "
-          f"(1 extract + up to {MAX_TRIES} generate + up to {MAX_TRIES} answer-predict)\n")
+    print(f"~{1 + 3 * MAX_TRIES} LLM calls per question "
+          f"(1 extract + up to {MAX_TRIES} generate + up to {MAX_TRIES} "
+          f"answer-predict + up to {MAX_TRIES} results-judge)\n")
 
     stats = {"ok": 0, "failed": 0, "skipped": 0, "generated": 0}
     processed = 0
@@ -1051,7 +1101,11 @@ def main():
             print(f"[{processed}] ({source}) {question[:80]}")
             if f_questions:
                 f_questions.write(question + "\n")
-            example, status = process_question(question, do_answer_check=not args.no_answer_check)
+            example, status = process_question(
+                question,
+                do_answer_check=not args.no_answer_check,
+                do_results_check=not args.no_results_check,
+            )
             if example is None:
                 stats["skipped" if "no " in status else "failed"] += 1
                 f_failed.write(json.dumps({"question": question, "reason": status}) + "\n")
