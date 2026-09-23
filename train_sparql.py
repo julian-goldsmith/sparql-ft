@@ -44,12 +44,12 @@ OUTPUT_DIR = "output/qwen3-0.6b-sparql"
 EVAL_PATH = "data/eval.jsonl"       # optional, used for post-train parse check
 
 LORA_R = 64                          # rank; 16-64. 16 is a fine start on 4B
-LORA_ALPHA = 32                      # 2x rank
+LORA_ALPHA = 128                      # 2x rank
 MAX_SEQ_LEN = 2048                   # bump to 4096 if you have the headroom
-BATCH_SIZE = 64                       # safe on 32GB; try 4-8
+BATCH_SIZE = 16                       # safe on 32GB; try 4-8
 GRAD_ACCUM = 1                       # effective batch = BATCH_SIZE * GRAD_ACCUM
 EPOCHS = 3
-LR = 1e-4
+LR = 1e-3                           # Would be 1e-5ish for full SFT, but LoRA likes larger LRs.
 
 # MLflow
 MLFLOW_TRACKING_URI = "sqlite:///mlflow.db"   # local, no server needed
@@ -111,7 +111,8 @@ training_args = SFTConfig(
     learning_rate=LR,
     lr_scheduler_type="cosine",
     warmup_steps=20,
-    logging_steps=10,
+    logging_steps=1,
+    logging_first_step=True,
     save_strategy="epoch",
     bf16=True,                          # Intel Arc native
     fp16=False,
