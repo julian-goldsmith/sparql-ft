@@ -108,6 +108,30 @@ RESULTS_SYSTEM = (
     'Reply with ONLY JSON: {"verdict": "answer|wrong|unsure", "reason": "short"}'
 )
 
+ANSWER_CHECK_SYSTEM = (
+    "You verify answers for SPARQL training data over the Yago knowledge "
+    "graph (a Wikipedia-derived snapshot). You are given a question, the "
+    "SPARQL query written for it, and the rows the query returned from the "
+    "graph. Decide:\n"
+    '- "correct": general knowledge confirms the rows give the right answer '
+    "to the question. Extra variants, other languages, or additional list "
+    "entries are fine.\n"
+    '- "wrong": the rows contradict general knowledge, are about a different '
+    "entity than the question names, or the query reads a different property "
+    "than what the question asks for (e.g. birth date when it asks for death "
+    "date).\n"
+    '- "plausible": the fact is too obscure to verify from general '
+    "knowledge, BUT the query clearly reads the property the question asks "
+    "about, anchors the entities it names, and the returned rows are a "
+    "sensible answer. Use this for obscure-but-real questions where the "
+    "query pattern is right.\n"
+    '- "unanswerable": the question is not a general-knowledge question at '
+    "all - it asks about the database itself (duplicates, record counts, "
+    "what the dataset contains).\n"
+    'Reply with ONLY JSON: {"verdict": "correct|wrong|plausible|unanswerable", '
+    '"reason": "short"}'
+)
+
 # Properties seen in the Yago4 graph (schema.org vocabulary) + the two
 # structural predicates every query needs. Grounds property choice instead
 # of letting the model guess property names.

@@ -43,13 +43,13 @@ DATA_PATH = "data/train.jsonl"
 OUTPUT_DIR = "output/qwen3-0.6b-sparql"
 EVAL_PATH = "data/eval.jsonl"       # optional, used for post-train parse check
 
-LORA_R = 16                          # rank; 16-64. 16 is a fine start on 4B
+LORA_R = 64                          # rank; 16-64. 16 is a fine start on 4B
 LORA_ALPHA = 32                      # 2x rank
 MAX_SEQ_LEN = 2048                   # bump to 4096 if you have the headroom
-BATCH_SIZE = 16                       # safe on 32GB; try 4-8
+BATCH_SIZE = 64                       # safe on 32GB; try 4-8
 GRAD_ACCUM = 1                       # effective batch = BATCH_SIZE * GRAD_ACCUM
 EPOCHS = 3
-LR = 2e-4
+LR = 1e-4
 
 # MLflow
 MLFLOW_TRACKING_URI = "sqlite:///mlflow.db"   # local, no server needed
@@ -110,7 +110,7 @@ training_args = SFTConfig(
     num_train_epochs=EPOCHS,
     learning_rate=LR,
     lr_scheduler_type="cosine",
-    warmup_steps=30,
+    warmup_steps=20,
     logging_steps=10,
     save_strategy="epoch",
     bf16=True,                          # Intel Arc native
@@ -118,18 +118,17 @@ training_args = SFTConfig(
     gradient_checkpointing=True,
     optim="adamw_torch",                # NOT paged_adamw_8bit (CUDA-only)
     max_grad_norm=1.0,
-    #report_to="mlflow",                # Logging is instead done through mlflow.peft.autolog()
+    report_to="mlflow",
     seed=42,
 
-    # FIXME: Correct?
     completion_only_loss=True,
+    max_length=MAX_SEQ_LEN,
 )
 
 trainer = SFTTrainer(
     model=model,
     args=training_args,
     train_dataset=dataset,
-    #max_seq_length=MAX_SEQ_LEN,
     # FIXME data_collator=collator,
     #packing=False,
     # Qwen3 has a "thinking" mode; force it OFF so the model outputs
@@ -154,7 +153,7 @@ with mlflow.start_run(run_name=f"{MODEL_NAME}-r{LORA_R}") as run:
         "effective_batch": BATCH_SIZE * GRAD_ACCUM,
         "epochs": EPOCHS,
         "lr": LR,
-        #"max_seq_len": MAX_SEQ_LEN,
+        "max_len": MAX_SEQ_LEN,
         "device": "xpu",
     })
 
@@ -163,8 +162,6 @@ with mlflow.start_run(run_name=f"{MODEL_NAME}-r{LORA_R}") as run:
 
     # Save adapter, then log it as an artifact
     trainer.save_model(OUTPUT_DIR)
-    #mlflow.log_artifacts(OUTPUT_DIR, artifact_path="adapter")
-    #mlflow.transformers.log_model(transformers_model=OUTPUT_DIR, name="adapter")
     mlflow.transformers.log_model(transformers_model={"model": trainer.model, "tokenizer": tokenizer_no_pad}, name="model", save_pretrained=False)
     mlflow.log_artifact(__file__, artifact_path="code")
 
@@ -178,17 +175,8 @@ with mlflow.start_run(run_name=f"{MODEL_NAME}-r{LORA_R}") as run:
         for row in rows:
             print(row['question'])
             messages = [
-                #{"role": "system", "content": (
-                    #"You are an expert SPARQL generator for the Yago knowledge graph. "
-                    #"Output ONLY the SPARQL query."
-                #)},
-                #{"role": "user", "content": (
-                    #f"Question: {row['question']}\n\nEntities:\n{row['entities']}"
-                    #f"\n\nPrefixes:\n{row['prefixes']}"
-                #)},
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": row['question']},
-                #{"role": "assistant", "content": row['gold_query']},
             ]
             inputs = tokenizer.apply_chat_template(
                 messages, tokenize=True, add_generation_prompt=True,
@@ -197,7 +185,7 @@ with mlflow.start_run(run_name=f"{MODEL_NAME}-r{LORA_R}") as run:
             ).to("xpu")
             with torch.no_grad():
                 out = model.generate(
-                    **inputs, max_new_tokens=512,
+                    **inputs, max_new_tokens=MAX_SEQ_LEN,
                     temperature=0.01, do_sample=True, top_p=0.9,
                 )
             q = strip_reasoning(

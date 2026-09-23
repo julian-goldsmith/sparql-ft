@@ -11,12 +11,14 @@ Pipeline per question:
      (entity pre-resolution is the #1 success factor for small models)
   3. Generate a SPARQL query with the LLM (resolved entities in prompt)
   4. Validate: rdflib parse + execute against Fuseki (must return results)
-  5. Expected-answer check: LLM predicts the answer from the question alone,
-     and the prediction must appear in the query's actual result set
-     (semantic correctness gate — catches wrong-property/wrong-entity queries)
-  6. Results-relevance judge: LLM sees question + query + ACTUAL result rows
-     and rejects when they don't answer the question (backstop for the
-     answer gate's UNKNOWN-accept and lenient substring matches)
+  5. Answer-correctness judge: LLM sees the question, the query, and the
+     ACTUAL result rows and judges with general knowledge; obscure facts
+     fall back to plausibility (right property/entities, sensible answer);
+     DB-meta questions (e.g. "are there duplicates in the database?") are
+     rejected outright, without wasting retries
+  6. Results-relevance judge: independent second read of question + query +
+     ACTUAL result rows; rejects when they don't answer the question,
+     accepts 'unsure'
   7. Up to MAX_TRIES attempts, feeding the rejection reason back to the LLM
   8. Write valid examples to train.jsonl (messages format) and eval.jsonl
      (flat format that validate.py expects)
@@ -57,7 +59,7 @@ import time
 import urllib.parse
 
 from yago_prompts import (YAGO_NS, PREFIXES, KNOWN_NS, SYSTEM_PROMPT,
-                          EXTRACT_SYSTEM, QUESTION_GEN_SYSTEM, ANSWER_SYSTEM,
+                          EXTRACT_SYSTEM, QUESTION_GEN_SYSTEM, ANSWER_CHECK_SYSTEM,
                           RESULTS_SYSTEM, PROPERTY_HINTS, strip_reasoning)
 
 from openai import OpenAI
@@ -348,116 +350,64 @@ def validate_query(query):
 
 
 # ---------------------------------------------------------------------------
-# Expected-answer verification (semantic correctness gate)
+# Answer-correctness gate (LLM judge)
 # ---------------------------------------------------------------------------
-def predict_answer(question, entities_block=None):
-    """LLM predicts the answer from the question ALONE plus the resolved
-    entities (for disambiguation) — never the query, so it can't just read
-    its own SPARQL back."""
+def check_answer_correct(question, query, rows, entities_block=None):
+    """LLM judges the query and its ACTUAL rows against the question, decided
+    with general world knowledge (ANSWER_CHECK_SYSTEM). Replaces the old
+    predict-then-string-match gate, which falsely rejected correct queries
+    whenever the blind prediction disagreed with the rows on wording.
+
+    Verdicts:
+      correct      -> pass: general knowledge confirms the answer
+      plausible    -> pass: fact too obscure to verify, but the query reads
+                      the right property/entities and the answer makes sense
+                      (deliberate fallback — not 100% verifiable, still
+                      worth training on)
+      wrong        -> reject; the feedback feeds the next generation attempt
+      unanswerable -> reject and FAIL FAST: the question itself is at fault
+                      (e.g. "Are there duplicates of this in the database?"),
+                      so burning retries on new queries cannot fix it.
+
+    Returns (ok, feedback, fatal). Unparseable judge output does not reject
+    (never lose a good example to a judge malfunction). Every verdict is
+    logged, so the plausible-fallback rate is auditable in the query log."""
     user = f"Question: {question}"
     if entities_block:
         user += f"\n\nContext entities:\n{entities_block}"
+    user += f"\n\nQuery:\n{query}"
+    user += f"\n\nReturned rows:\n{rows_preview(rows, limit=8)}"
     msgs = [
-        {"role": "system", "content": ANSWER_SYSTEM},
+        {"role": "system", "content": ANSWER_CHECK_SYSTEM},
         {"role": "user", "content": user},
     ]
-    raw = strip_reasoning(llm_chat(msgs, temperature=0.0, max_tokens=1024))
-    return raw.strip()
-
-
-def normalize_answer(text):
-    """Prediction -> set of comparable strings. Handles URI tails, lists,
-    punctuation, case."""
-    if not text or text.upper() == "UNKNOWN":
-        return set()
-    parts = re.split(r"[\n,;]", text)
-    out = set()
-    for p in parts:
-        p = p.strip().strip(".-'\"")
-        if not p:
-            continue
-        # URI tail: last path segment, underscores -> spaces
-        tail = p.rstrip("/").rsplit("/", 1)[-1].rsplit("#", 1)[-1].replace("_", " ")
-        out.add(tail.lower())
-        out.add(p.lower())
-    return out
-
-
-def normalize_results(rows):
-    """Fuseki bindings -> set of comparable strings (URI tails + literals)."""
-    out = set()
-    for r in rows:
-        for v in r.values():
-            val = v["value"]
-            if v.get("type") == "uri":
-                tail = val.rstrip("/").rsplit("/", 1)[-1].rsplit("#", 1)[-1].replace("_", " ")
-                out.add(tail.lower())
-            else:
-                out.add(val.strip().lower())
-    return out
-
-
-def check_expected_answer(question, query, rows, entities_block=None):
-    """Returns (ok, feedback). Prediction must appear in the query results.
-    An UNKNOWN/empty prediction is 'unverifiable', not 'wrong' — the query
-    already executed and returned rows, so we accept instead of rejecting."""
-    prediction = predict_answer(question, entities_block)
-    if not prediction or prediction.strip(".! ").upper() == "UNKNOWN":
-        return True, ""
-
-    # Yes/no questions: a non-empty result set IS the affirmative answer.
-    # (Rows are guaranteed non-empty here — empty results are rejected
-    # earlier by validate_query.) Without this, "Yes" vs ["Order of..."]
-    # poisons the retry loop into trying to SELECT the literal "Yes".
-    norm_pred = prediction.strip(".,;:! \t").lower()
-    if norm_pred in ("yes", "y", "yeah", "yep", "true"):
-        return True, ""
-    if norm_pred in ("no", "n", "nope", "false"):
-        return False, (
-            "Expected answer was 'no' but the query returned rows — the "
-            "question is yes/no phrased; check whether the pattern matches "
-            "the question's intent"
-        )
-
-    # Aggregate queries: compare numerically
-    if re.search(r"\b(COUNT|SUM|AVG|MIN|MAX)\s*\(", query, re.I):
-        pred_nums = re.findall(r"-?\d+(?:\.\d+)?", prediction)
-        result_nums = re.findall(r"-?\d+(?:\.\d+)?", " ".join(v["value"] for r in rows for v in r.values()))
-        if pred_nums and result_nums and abs(float(pred_nums[0]) - float(result_nums[0])) < 1e-6:
-            return True, ""
-        return False, (
-            f"Expected answer mismatch: predicted '{prediction}', "
-            f"query returned {result_nums[:5]}"
-        )
-
-    pred_set = normalize_answer(prediction)
-    result_set = normalize_results(rows)
-    if pred_set & result_set:
-        return True, ""
-
-    # Lenient pass: prediction is a superset mention of a result (e.g. "the film Inception")
-    for p in pred_set:
-        for r in result_set:
-            if p in r or r in p:
-                return True, ""
-
-    sample = sorted(result_set)[:5]
-    return False, (
-        f"Expected answer mismatch: predicted '{prediction}', "
-        f"query returned {sample}"
-    )
+    raw = strip_reasoning(llm_chat(msgs, temperature=0.0, max_tokens=512))
+    m = re.search(r"\{.*\}", raw, re.DOTALL)
+    if not m:
+        return True, "", False
+    try:
+        verdict = json.loads(m.group(0))
+    except json.JSONDecodeError:
+        return True, "", False
+    v = str(verdict.get("verdict", "correct")).strip().lower()
+    reason = str(verdict.get("reason", ""))[:300]
+    log_event({"type": "answer_check", "question": question,
+               "verdict": v, "reason": reason})
+    if v == "wrong":
+        return False, f"Answer judged incorrect: {reason}", False
+    if v == "unanswerable":
+        return False, reason, True
+    return True, "", False   # "correct" and "plausible" — and anything else — pass
 
 
 def check_results_relevant(question, query, rows):
-    """Results-relevance judge — backstop for check_expected_answer's blind
-    spots. The expected-answer gate trusts the predictor: an UNKNOWN
-    prediction is ACCEPTED unverified, and lenient substring matches can pass
-    by accident, so a gold query whose rows answer a different question can
-    survive. This judge sees the question, the query, and the ACTUAL rows and
-    rejects when they don't line up (wrong property, wrong entity).
-    'unsure' accepts: same accept-not-reject philosophy as UNKNOWN above, and
-    it keeps genuinely ambiguous questions from burning the retry budget.
-    Only called with non-empty rows (validate_query rejects empties first)."""
+    """Results-relevance judge — independent second read after the
+    answer-correctness gate. Both now see question + query + rows; this one
+    exists as a backstop because a single judge can rationalize a subtly
+    wrong pattern. Rejects when query + rows don't line up with the
+    question's intent; 'unsure' accepts, keeping genuinely ambiguous
+    questions from burning the retry budget. Only called with non-empty
+    rows (validate_query rejects empties first)."""
     user = (
         f"Question: {question}\n\nQuery:\n{query}\n\n"
         f"Result rows:\n{rows_preview(rows, limit=8)}"
@@ -810,12 +760,19 @@ def process_question(question, do_answer_check=True, do_results_check=True,
             "feedback": feedback[:300],
         })
         if ok and do_answer_check:
-            # Semantic gate: does the query actually answer the question?
-            ok, feedback = check_expected_answer(question, query, rows, entities_block)
+            # Correctness gate: an LLM judge decides with general knowledge
+            # whether the rows answer the question — it sees the query too.
+            # Obscure-but-real facts fall back to structural plausibility
+            # (verdict "plausible" passes). fatal=True means the QUESTION is
+            # broken (database-meta questions) — new queries can't fix that,
+            # so fail fast instead of burning retries.
+            ok, feedback, fatal = check_answer_correct(question, query, rows, entities_block)
+            if fatal:
+                return None, f"unanswerable question ({feedback})"
         if ok and do_results_check:
-            # Relevance gate: judge sees question + query + ACTUAL rows, so it
-            # catches wrong-data gold queries the answer gate let through
-            # (UNKNOWN predictions are accepted unverified there).
+            # Relevance gate: judge sees question + query + ACTUAL rows and
+            # catches wrong-property/wrong-entity patterns the correctness
+            # judge may read charitably ('unsure' accepts).
             ok, feedback = check_results_relevant(question, query, rows)
         if ok:
             # Plain-language user turn: ONLY the question. The Entities/
@@ -832,7 +789,7 @@ def process_question(question, do_answer_check=True, do_results_check=True,
         last_error = feedback
         last_query = query
         last_rows = rows or None   # [] on empty results -> no preview to show
-        print(f"{tag}[attempt {attempt}/{MAX_TRIES}] rejected: {feedback[:120]}")
+        print(f"{tag}[attempt {attempt}/{MAX_TRIES}] rejected: {feedback[:300]}")
         time.sleep(SLEEP_BETWEEN_CALLS)
 
     return None, f"failed after {MAX_TRIES} attempts: {last_error}"
@@ -912,7 +869,7 @@ def main():
                     help="questions processed concurrently (thread pool running "
                          "the full per-question pipeline)")
     ap.add_argument("--no-answer-check", action="store_true",
-                    help="skip the expected-answer verification (faster, weaker filter)")
+                    help="skip the answer-correctness judge (faster, weaker filter)")
     ap.add_argument("--no-results-check", action="store_true",
                     help="skip the results-relevance judge (faster, weaker filter)")
     ap.add_argument("--pool-file", default="data/entity_pool.json",
@@ -974,7 +931,7 @@ def main():
           f"{args.workers} concurrent workers)")
     print(f"~{1 + 3 * MAX_TRIES} LLM calls per question "
           f"(1 extract + up to {MAX_TRIES} generate + up to {MAX_TRIES} "
-          f"answer-predict + up to {MAX_TRIES} results-judge)\n")
+          f"answer-judge + up to {MAX_TRIES} results-judge)\n")
 
     # Worker pool: N threads run process_question; the main thread feeds the
     # task queue, drains the result queue, and writes every output file.
