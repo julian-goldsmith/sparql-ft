@@ -119,18 +119,29 @@ POOL_RING = []     # shuffled index ring so samples don't repeat until exhausted
 # ---------------------------------------------------------------------------
 # OpenRouter client
 # ---------------------------------------------------------------------------
-api_key = os.environ.get("OPENROUTER_API_KEY")
-if not api_key:
-    sys.exit("ERROR: set OPENROUTER_API_KEY (export OPENROUTER_API_KEY=sk-or-...)")
+if False:
+    api_key = os.environ.get("OPENROUTER_API_KEY")
+    if not api_key:
+        sys.exit("ERROR: set OPENROUTER_API_KEY (export OPENROUTER_API_KEY=sk-or-...)")
 
-client = OpenAI(
-    base_url="https://openrouter.ai/api/v1",
-    api_key=api_key,
-    default_headers={
-        "HTTP-Referer": "https://github.com/",   # OpenRouter asks for these
-        "X-Title": "yago-sparql-data-gen",
-    },
-)
+    client = OpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=api_key,
+        default_headers={
+            "HTTP-Referer": "https://github.com/",   # OpenRouter asks for these
+            "X-Title": "yago-sparql-data-gen",
+        },
+    )
+else:
+    api_key = 'PLACEHOLDER'
+    client = OpenAI(
+        base_url="http://192.168.8.200:9931/v1",
+        api_key=api_key,
+        default_headers={
+            "HTTP-Referer": "https://github.com/",   # OpenRouter asks for these
+            "X-Title": "yago-sparql-data-gen",
+        },
+    )
 
 
 def llm_chat(messages, temperature=0.1, max_tokens=2048):

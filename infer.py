@@ -16,35 +16,27 @@ import torch
 from yago_prompts import SYSTEM_PROMPT
 from validate import strip_reasoning
 
-EXPERIMENT = "qwen3-0.6b-sparql"
+# Quick transformers test cell
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
 MAX_NEW_TOKENS = 2048  # SPARQL gen default
-
-
-def resolve_uri(explicit):
-    if explicit:
-        return explicit
-    exp = mlflow.get_experiment_by_name(EXPERIMENT)
-    newest = mlflow.search_runs(
-        [exp.experiment_id], order_by=["start_time DESC"], max_results=1
-    )
-    return f"runs:/{newest.run_id.iloc[0]}/model"
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("question")
-    ap.add_argument("--uri", default=None,
-                    help="runs:/<run_id>/model (default: newest run)")
+    ap.add_argument("--model", default="Qwen/Qwen3.5-0.8B")
     args = ap.parse_args()
 
-    mlflow.set_tracking_uri("sqlite:///mlflow.db")  # must match training
     device = "xpu" if (hasattr(torch, "xpu") and torch.xpu.is_available()) else "cpu"
+    print(f"Using model {args.model} on device {device}")
 
-    comps = mlflow.transformers.load_model(resolve_uri(args.uri),
-                                           return_type="components")
-    model, tokenizer = comps["model"], comps["tokenizer"]
-    model = model.to(device).eval()
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype="auto", device_map=device)
 
+    # If Qwen3's thinking mode leaks in, add:
+    #   chat_template_kwargs={"enable_thinking": False}
+    # strip_reasoning below catches stray <think> blocks anyway.
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": args.question},
@@ -56,9 +48,6 @@ def main():
         return_tensors="pt",
         return_dict=True,
     ).to(device)
-    # If Qwen3's thinking mode leaks in, add:
-    #   chat_template_kwargs={"enable_thinking": False}
-    # strip_reasoning below catches stray <think> blocks anyway.
 
     with torch.no_grad():
         out = model.generate(
