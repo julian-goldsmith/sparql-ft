@@ -468,8 +468,7 @@ def generate_sparql(question, entities_block, error=None, attempt=0,
                     prev_query=None, prev_rows=None):
     user = (
         f"Question: {question}\n\nEntities:\n{entities_block}\n\n"
-        #FIXME: Need hints?  f"Properties:\n{PROPERTY_HINTS}\n\nPrefixes:\n{PREFIXES}"
-        f"Prefixes:\n{PREFIXES}"
+        f"Properties:\n{PROPERTY_HINTS}\n\nPrefixes:\n{PREFIXES}"
     )
     if error:
         user += f"\n\nYour previous attempt was rejected:\n{error}"

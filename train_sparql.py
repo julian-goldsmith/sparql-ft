@@ -38,22 +38,22 @@ from yago_prompts import (YAGO_NS, PREFIXES, KNOWN_NS, SYSTEM_PROMPT,
 # Config
 # ---------------------------------------------------------------------------
 #MODEL_NAME = "Qwen/Qwen3.5-4B-Base"        # or Qwen/Qwen3-1.7B for max speed
-MODEL_NAME = "Qwen/Qwen3-0.6B"        # or Qwen/Qwen3-1.7B for max speed
+MODEL_NAME = "Qwen/Qwen3.5-0.8B"        # or Qwen/Qwen3-1.7B for max speed
 DATA_PATH = "data/train.jsonl"
-OUTPUT_DIR = "output/qwen3-0.6b-sparql"
+OUTPUT_DIR = "output/qwen3.5-0.8b-sparql"
 EVAL_PATH = "data/eval.jsonl"       # optional, used for post-train parse check
 
 LORA_R = 64                          # rank; 16-64. 16 is a fine start on 4B
-LORA_ALPHA = 128                      # 2x rank
+LORA_ALPHA = 128                     # 2x rank
 MAX_SEQ_LEN = 2048                   # bump to 4096 if you have the headroom
-BATCH_SIZE = 16                       # safe on 32GB; try 4-8
-GRAD_ACCUM = 1                       # effective batch = BATCH_SIZE * GRAD_ACCUM
+BATCH_SIZE = 16                      # safe on 32GB; try 4-8
+GRAD_ACCUM = 2                       # effective batch = BATCH_SIZE * GRAD_ACCUM
 EPOCHS = 3
-LR = 1e-3                           # Would be 1e-5ish for full SFT, but LoRA likes larger LRs.
+LR = 3e-4                           # Would be 1e-5ish for full SFT, but LoRA likes larger LRs.
 
 # MLflow
 MLFLOW_TRACKING_URI = "sqlite:///mlflow.db"   # local, no server needed
-MLFLOW_EXPERIMENT = "qwen3-0.6b-sparql"
+MLFLOW_EXPERIMENT = "qwen3.5-0.8b-sparql"
 
 # ---------------------------------------------------------------------------
 # Load model — bf16 on XPU (Arc has native bf16; no quantization needed)
@@ -70,19 +70,20 @@ if tokenizer.pad_token is None:
 # ---------------------------------------------------------------------------
 # LoRA
 # ---------------------------------------------------------------------------
-lora_config = LoraConfig(
-    r=LORA_R,
-    lora_alpha=LORA_ALPHA,
-    target_modules=[
-        "q_proj", "k_proj", "v_proj", "o_proj",
-        "gate_proj", "up_proj", "down_proj",
-    ],
-    lora_dropout=0.05,
-    bias="none",
-    task_type="CAUSAL_LM",
-)
-model = get_peft_model(model, lora_config)
-model.print_trainable_parameters()   # expect ~0.5-2% trainable
+if False:
+    lora_config = LoraConfig(
+        r=LORA_R,
+        lora_alpha=LORA_ALPHA,
+        target_modules=[
+            "q_proj", "k_proj", "v_proj", "o_proj",
+            "gate_proj", "up_proj", "down_proj",
+        ],
+        lora_dropout=0.05,
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
+    model = get_peft_model(model, lora_config)
+    model.print_trainable_parameters()   # expect ~0.5-2% trainable
 
 # Note: no ipex.optimize() — IPEX is EOL. Native torch.xpu handles bf16.
 # If you want graph-level speedups, try torch.compile(model, backend="xpu").
@@ -116,11 +117,15 @@ training_args = SFTConfig(
     save_strategy="epoch",
     bf16=True,                          # Intel Arc native
     fp16=False,
-    gradient_checkpointing=True,
-    optim="adamw_torch",                # NOT paged_adamw_8bit (CUDA-only)
+    gradient_checkpointing=True,        # True to save VRAM from activations.
+    packing=True,
+    packing_strategy="wrapped",
+    #optim="adamw_torch",               # NOT paged_adamw_8bit (CUDA-only)
+    optim="adamw_torch_fused",          # NOT paged_adamw_8bit (CUDA-only)
     max_grad_norm=1.0,
     report_to="mlflow",
     seed=42,
+    # Doesn't work quite right: torch_compile=True,
 
     completion_only_loss=True,
     max_length=MAX_SEQ_LEN,
@@ -131,7 +136,6 @@ trainer = SFTTrainer(
     args=training_args,
     train_dataset=dataset,
     # FIXME data_collator=collator,
-    #packing=False,
     # Qwen3 has a "thinking" mode; force it OFF so the model outputs
     # plain SPARQL, not wrapped in <|thinking_start|> blocks.
     #chat_template_kwargs={"enable_thinking": False},
