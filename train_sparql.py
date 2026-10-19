@@ -103,7 +103,6 @@ response_template = "<|im_start|>assistant"
 # Trainer — bf16=True (Arc native), plain adamw (bitsandbytes is CUDA-only)
 # report_to="mlflow" makes HF auto-log train loss every logging step.
 # ---------------------------------------------------------------------------
-#FIXME training_args = TrainingArguments(
 training_args = SFTConfig(
     output_dir=OUTPUT_DIR,
     per_device_train_batch_size=BATCH_SIZE,
