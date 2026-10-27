@@ -9,7 +9,8 @@ from yago_prompts import SYSTEM_PROMPT
 from validate import strip_reasoning
 
 FUSEKI = "http://192.168.8.110:3030/yago/sparql"
-MODEL = "./output/qwen3.5-0.8b-sparql/checkpoint-294/"
+#MODEL = "./output/qwen3.5-0.8b-sparql/checkpoint-294/"
+MODEL = "./output/qwen3.5-0.8b-sparql/checkpoint-1036/"
 OUTPUT_DIR = "output/qwen3.5-0.8b-sparql-rl"
 
 # MLflow
@@ -63,7 +64,7 @@ async def jena_reward(completions, gold_queries, **kwargs):
             # Nothing to compare to.
             return 0.0
 
-        return (0.4 + 0.6 * len(pred & gold) / len(pred | gold)) * ((10. / (10. + duration_s)) ** 2)
+        return (0.2 + 0.8 * len(pred & gold) / len(pred | gold)) * ((3. / (3. + duration_s)) ** 2)
 
     return await asyncio.gather(*(score(c, g) for c, g in zip(completions, gold_queries)))
 
@@ -78,7 +79,7 @@ def convert_ds(example):
     }
 
 #ds = load_dataset("json", data_files="data/train_small.jsonl", split="train")
-ds = load_dataset("json", data_files="data/train_1.jsonl", split="train")
+ds = load_dataset("json", data_files="data/train_rl.jsonl", split="train")
 ds = ds.map(convert_ds, remove_columns=ds.column_names)
 
 
@@ -87,22 +88,25 @@ trainer = GRPOTrainer(
     processing_class=AutoTokenizer.from_pretrained(MODEL),
     reward_funcs=[jena_reward],
     train_dataset=ds,
-    args=GRPOConfig(num_generations=8,
+    args=GRPOConfig(num_generations=4,
                     generation_batch_size=8,
+                    per_device_train_batch_size=8,
+                    gradient_accumulation_steps=8,
                     max_completion_length=256,
-                    learning_rate=1e-6,                     # 1/10th of the LR for SFT.
+                    learning_rate=3e-6,                     # 1/10th of the LR for SFT.
                     warmup_steps=20,                         # FIXME: Increase with larger DS.
                     lr_scheduler_type="cosine",
                     bf16=True, fp16=False,
                     optim="adamw_torch_fused",
-                    max_grad_norm=.5,
+                    max_grad_norm=1.,
                     beta=.03,
                     temperature=1.2,
                     report_to="mlflow",
                     logging_steps=1, logging_first_step=True,
                     # Makes MLFlow run name always the same: seed=1234,
-                    num_train_epochs=3,
+                    num_train_epochs=1,
                     prediction_loss_only=True,
+                    mask_truncated_completions=True,
                     use_vllm=False, vllm_gpu_memory_utilization=0.3),
 )
 trainer.train()
