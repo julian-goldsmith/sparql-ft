@@ -70,10 +70,14 @@ from SPARQLWrapper import SPARQLWrapper, JSON
 # Config
 # ---------------------------------------------------------------------------
 DEFAULT_MODEL = "z-ai/glm-5.3-flash"
+#DEFAULT_MODEL = "qwen/qwen3.8-27b:nitro"
+#SPARQL_MODEL = "qwen/qwen3.8-27b:floor"
+SPARQL_MODEL = "z-ai/glm-5.3-flash"
+#DEFAULT_MODEL = "Qwen3.8-27B"
 DEFAULT_FUSEKI = "http://192.168.8.110:3030/yago/sparql"
 MAX_TRIES = 3                                 # total attempts per question (1 initial + 2 retries)
 EVAL_RATIO = 0.1                              # fraction of examples routed to eval.jsonl
-SLEEP_BETWEEN_CALLS = 1.0                     # polite to OpenRouter rate limits
+SLEEP_BETWEEN_CALLS = 0.1                     # polite to OpenRouter rate limits
 # RNG seeding is done in main(): pass --seed N for reproducible sampling,
 # otherwise every run draws a fresh random seed (printed to the log).
 QUERY_TIMEOUT = 120                           # seconds; aborts runaway Fuseki queries instead of hanging
@@ -119,7 +123,7 @@ POOL_RING = []     # shuffled index ring so samples don't repeat until exhausted
 # ---------------------------------------------------------------------------
 # OpenRouter client
 # ---------------------------------------------------------------------------
-if False:
+if True:
     api_key = os.environ.get("OPENROUTER_API_KEY")
     if not api_key:
         sys.exit("ERROR: set OPENROUTER_API_KEY (export OPENROUTER_API_KEY=sk-or-...)")
@@ -144,7 +148,7 @@ else:
     )
 
 
-def llm_chat(messages, temperature=0.1, max_tokens=2048):
+def llm_chat(messages, temperature=0.1, max_tokens=8192, include_reasoning=False, reasoning_level=REASONING_EFFORT, model=DEFAULT_MODEL):
     """One OpenRouter chat completion with basic 429/error retry.
 
     Reasoning models (GLM etc.) burn tokens on thinking before answering —
@@ -152,19 +156,25 @@ def llm_chat(messages, temperature=0.1, max_tokens=2048):
     Thinking effort comes from REASONING_EFFORT (default 'low'); empty
     content is treated as a retryable failure, retries get extra headroom."""
     for attempt in range(3):
+        #print(f"llm call attempt {attempt}, {messages[-1]['content']}")
         try:
             resp = client.chat.completions.create(
-                model=MODEL,
+                model=model,
                 messages=messages,
                 temperature=temperature,
                 max_tokens=max_tokens + attempt * 1024,
-                extra_body={"reasoning": {"effort": REASONING_EFFORT}},
+                extra_body={"reasoning": {"effort": reasoning_level}},
             )
             content = resp.choices[0].message.content
             if not content or not content.strip():
                 finish = getattr(resp.choices[0], "finish_reason", "?")
                 raise ValueError(f"empty content (finish_reason={finish})")
-            return content
+
+            #print(f'reasoning_content: {json.dumps(dict(resp.choices[0].message))}')
+            if include_reasoning:
+                return content, resp.choices[0].message.reasoning
+            else:
+                return content
         except Exception as e:
             msg = str(e)
             wait = 10 if "429" in msg else 2 ** attempt
@@ -392,21 +402,25 @@ def check_answer_correct(question, query, rows, entities_block=None):
         {"role": "system", "content": ANSWER_CHECK_SYSTEM},
         {"role": "user", "content": user},
     ]
-    raw = strip_reasoning(llm_chat(msgs, temperature=0.0, max_tokens=512))
+    raw, reasoning = strip_reasoning(llm_chat(msgs, temperature=0.0, max_tokens=8192))
     m = re.search(r"\{.*\}", raw, re.DOTALL)
     if not m:
+        #print('no match')
         return True, "", False
     try:
         verdict = json.loads(m.group(0))
     except json.JSONDecodeError:
+        #print('JSON decode failed (check_answer_correct): {m.group(0)}')
         return True, "", False
     v = str(verdict.get("verdict", "correct")).strip().lower()
     reason = str(verdict.get("reason", ""))[:300]
     log_event({"type": "answer_check", "question": question,
                "verdict": v, "reason": reason})
     if v == "wrong":
+        #print(f"Answer judged incorrect: {reason}")
         return False, f"Answer judged incorrect: {reason}", False
     if v == "unanswerable":
+        #print(f"Unanswerable: {reason}")
         return False, reason, True
     return True, "", False   # "correct" and "plausible" — and anything else — pass
 
@@ -427,13 +441,15 @@ def check_results_relevant(question, query, rows):
         {"role": "system", "content": RESULTS_SYSTEM},
         {"role": "user", "content": user},
     ]
-    raw = strip_reasoning(llm_chat(msgs, temperature=0.0, max_tokens=512))
+    raw, reasoning = strip_reasoning(llm_chat(msgs, temperature=0.0, max_tokens=8192))
     m = re.search(r"\{.*\}", raw, re.DOTALL)
     if not m:
+        #print('no match: {raw}')
         return True, ""   # unparseable judge output -> don't reject on a judge malfunction
     try:
         verdict = json.loads(m.group(0))
     except json.JSONDecodeError:
+        #print('JSON decode failed (check_results_relevant): {m.group(0)}')
         return True, ""
     v = str(verdict.get("verdict", "unsure")).strip().lower()
     reason = str(verdict.get("reason", ""))[:300]
@@ -455,7 +471,7 @@ def extract_mentions(question):
         {"role": "system", "content": EXTRACT_SYSTEM},
         {"role": "user", "content": f"Question: {question}"},
     ]
-    raw = strip_reasoning(llm_chat(msgs, temperature=0.0, max_tokens=1024))
+    raw, reasoning = strip_reasoning(llm_chat(msgs, temperature=0.0, max_tokens=8192))
     m = re.search(r"\[.*\]", raw, re.DOTALL)
     if not m:
         return []
@@ -463,6 +479,7 @@ def extract_mentions(question):
         mentions = json.loads(m.group(0))
         return [x for x in mentions if isinstance(x, str) and x.strip()]
     except json.JSONDecodeError:
+        #print(f'JSON decode failed (extract_mentions): {m.group(0)}')
         return re.findall(r'"([^"]+)"', m.group(0))
 
 
@@ -497,8 +514,11 @@ def generate_sparql(question, entities_block, error=None, attempt=0,
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user},
     ]
-    raw = llm_chat(msgs, temperature=0.1, max_tokens=1024)
-    query = strip_reasoning(raw)
+    raw, reasoning = llm_chat(msgs, temperature=0.1, max_tokens=8192, include_reasoning=True, reasoning_level='max', model=SPARQL_MODEL)
+    #query, reasoning = strip_reasoning(raw)
+    query = raw
+    #print(f'generate_sparql - query: {query}, reasoning: {reasoning}')
+    #print(f'generate_sparql - reasoning: {reasoning}')
     query, repaired = ensure_prefixes(query)
     log_event({
         "type": "sparql_gen",
@@ -508,7 +528,7 @@ def generate_sparql(question, entities_block, error=None, attempt=0,
         "query": query,
         "prefix_repair": repaired,
     })
-    return query
+    return query, reasoning
 
 
 # ---------------------------------------------------------------------------
@@ -658,7 +678,8 @@ def generate_question(entity_label, prop_label):
             ),
         },
     ]
-    q = strip_reasoning(llm_chat(msgs, temperature=0.8, max_tokens=1024))
+    q, reasoning = strip_reasoning(llm_chat(msgs, temperature=0.8, max_tokens=8192))
+    #print(f'generate_question - query: {q}, reasoning: {reasoning}')
     return q.strip().rstrip("?") + "?" if q else ""
 
 
@@ -756,9 +777,10 @@ def process_question(question, do_answer_check=True, do_results_check=True,
     last_query = None
     last_rows = None
     for attempt in range(1, MAX_TRIES + 1):
-        query = generate_sparql(question, entities_block, error=last_error,
+        query, reasoning = generate_sparql(question, entities_block, error=last_error,
                                 attempt=attempt, prev_query=last_query,
                                 prev_rows=last_rows)
+        #print(f'query: {query}, reasoning: {reasoning}')
         try:
             ok, feedback, rows = validate_query(query)
         except Exception as e:
@@ -793,7 +815,7 @@ def process_question(question, do_answer_check=True, do_results_check=True,
                 "messages": [
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": question},
-                    {"role": "assistant", "content": query},
+                    {"role": "assistant", "reasoning_content": reasoning, "content": query},
                 ]
             }
             return example, f"ok (attempt {attempt})"

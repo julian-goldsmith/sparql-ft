@@ -37,24 +37,24 @@ from yago_prompts import (YAGO_NS, PREFIXES, KNOWN_NS, SYSTEM_PROMPT,
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-#MODEL_NAME = "Qwen/Qwen3.5-4B-Base"        # or Qwen/Qwen3-1.7B for max speed
-MODEL_NAME = "Qwen/Qwen3.5-0.8B"
+MODEL_NAME = "Qwen/Qwen3.5-4B"        # or Qwen/Qwen3-1.7B for max speed
+#MODEL_NAME = "Qwen/Qwen3.5-0.8B"
 DATA_PATH = "data/train_sft.jsonl"
-OUTPUT_DIR = "output/qwen3.5-0.8b-sparql"
+OUTPUT_DIR = "output/qwen3.5-4b-sparql"
 EVAL_PATH = "data/eval.jsonl"       # optional, used for post-train parse check
 
-LORA_R = 64                          # rank; 16-64. 16 is a fine start on 4B
-LORA_ALPHA = 128                     # 2x rank
-MAX_SEQ_LEN = 256                   # bump to 4096 if you have the headroom
+LORA_R = 16                          # rank; 16-64. 16 is a fine start on 4B
+LORA_ALPHA = LORA_R*2                     # 2x rank
+MAX_SEQ_LEN = 2048                   # bump to 4096 if you have the headroom
 BATCH_SIZE = 4                      # safe on 32GB; try 4-8
-GRAD_ACCUM = 1                       # effective batch = BATCH_SIZE * GRAD_ACCUM
+GRAD_ACCUM = 2                       # effective batch = BATCH_SIZE * GRAD_ACCUM
 EPOCHS = 2
-LR = 1e-5                           # Would be 1e-5ish for full SFT, but LoRA likes larger LRs.
+LR = 3e-5                           # Would be 1e-5ish for full SFT, but LoRA likes larger LRs.
 
 # MLflow
 #MLFLOW_TRACKING_URI = "sqlite:///mlflow.db"   # local, no server needed
 MLFLOW_TRACKING_URI = "http://192.168.8.110:5000/"
-MLFLOW_EXPERIMENT = "qwen3.5-0.8b-sparql"
+MLFLOW_EXPERIMENT = "qwen3.5-4b-sparql"
 
 # ---------------------------------------------------------------------------
 # Load model — bf16 on XPU (Arc has native bf16; no quantization needed)
@@ -71,7 +71,7 @@ if tokenizer.pad_token is None:
 # ---------------------------------------------------------------------------
 # LoRA
 # ---------------------------------------------------------------------------
-if False:
+if True:
     lora_config = LoraConfig(
         r=LORA_R,
         lora_alpha=LORA_ALPHA,
@@ -118,16 +118,18 @@ training_args = SFTConfig(
     bf16=True,                          # Intel Arc native
     fp16=False,
     gradient_checkpointing=True,        # True to save VRAM from activations.
-    packing=True,
-    packing_strategy="wrapped",
+    #packing=True,
+    #packing_strategy="wrapped",
     #optim="adamw_torch",               # NOT paged_adamw_8bit (CUDA-only)
-    optim="adamw_torch_fused",          # NOT paged_adamw_8bit (CUDA-only)
+    #optim="adamw_torch_fused",          # NOT paged_adamw_8bit (CUDA-only)
+    optim="adamw_torch_8bit",          # NOT paged_adamw_8bit (CUDA-only)
     max_grad_norm=1.0,
     report_to="mlflow",
     seed=42,
     # Doesn't work quite right: torch_compile=True,
 
     completion_only_loss=True,
+    assistant_only_loss=True,
     max_length=MAX_SEQ_LEN,
 )
 
@@ -167,7 +169,7 @@ with mlflow.start_run(run_name=f"{MODEL_NAME}-r{LORA_R}") as run:
 
     # Save adapter, then log it as an artifact
     trainer.save_model(OUTPUT_DIR)
-    mlflow.transformers.log_model(transformers_model={"model": trainer.model, "tokenizer": tokenizer_no_pad}, name="model", save_pretrained=False)
+    # FIXME: LoRA mlflow.transformers.log_model(transformers_model={"model": trainer.model, "tokenizer": tokenizer_no_pad}, name="model", save_pretrained=False)
     mlflow.log_artifact(__file__, artifact_path="code")
 
     # Optional: quick post-train parse-rate check on a small eval set

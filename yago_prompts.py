@@ -198,11 +198,31 @@ PROPERTY_HINTS = (
 )
 
 
+#def strip_reasoning(text):
+    #"""Remove thinking blocks and code fences so only the answer remains."""
+    #if not text:            # reasoning models can return None content
+        #return ""
+    #text = re.sub(r"<\|thinking_start\|>.*?<\|thinking_end\|>", "", text, flags=re.DOTALL)
+    #text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    #text = re.sub(r"```(?:sparql)?\s*(.*?)\s*```", r"\1", text, flags=re.DOTALL)
+    #return text.strip()
+
 def strip_reasoning(text):
-    """Remove thinking blocks and code fences so only the answer remains."""
-    if not text:            # reasoning models can return None content
-        return ""
-    text = re.sub(r"<\|thinking_start\|>.*?<\|thinking_end\|>", "", text, flags=re.DOTALL)
-    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
-    text = re.sub(r"```(?:sparql)?\s*(.*?)\s*```", r"\1", text, flags=re.DOTALL)
-    return text.strip()
+    """Return (reasoning, answer) separately."""
+    if not text:
+        return "", ""
+    m = re.search(r"<\|thinking_start\|>.*?<\|thinking_end\|>", text, flags=re.DOTALL)
+    if m:
+        reasoning = m.group(1).strip()
+        answer = re.sub(r"<\|thinking_start\|>.*?<\|thinking_end\|>", "", text, flags=re.DOTALL).strip()
+    else:
+        m = re.search(r".*?</think>", text, flags=re.DOTALL)
+        if m:
+            reasoning = m.group(0).strip()
+            answer = re.sub(r".*?</think>", "", text, flags=re.DOTALL).strip()
+        else:
+            reasoning = ""
+            answer = text.strip()
+    # clean up code fences if wanted
+    answer = re.sub(r"```(?:sparql)?\s*(.*?)\s*```", r"\1", answer, flags=re.DOTALL)
+    return answer, reasoning

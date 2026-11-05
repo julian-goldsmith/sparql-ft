@@ -1,4 +1,4 @@
-import asyncio, re, aiohttp
+import asyncio, re, aiohttp, torch
 from datasets import load_dataset
 from trl import GRPOConfig, GRPOTrainer
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -10,19 +10,33 @@ from validate import strip_reasoning
 
 FUSEKI = "http://192.168.8.110:3030/yago/sparql"
 #MODEL = "./output/qwen3.5-0.8b-sparql/checkpoint-294/"
-MODEL = "./output/qwen3.5-0.8b-sparql/checkpoint-1036/"
-OUTPUT_DIR = "output/qwen3.5-0.8b-sparql-rl"
+MODEL = "./output/qwen3.5-0.8b-sparql/checkpoint-346/" # FIXME: 4B
+OUTPUT_DIR = "output/qwen3.5-4b-sparql-rl"
 
 # MLflow
 #MLFLOW_TRACKING_URI = "sqlite:///mlflow.db"   # local, no server needed
 MLFLOW_TRACKING_URI = "http://192.168.8.110:5000/"
-MLFLOW_EXPERIMENT = "qwen3.5-0.8b-sparql-rl"
+MLFLOW_EXPERIMENT = "qwen3.5-4b-sparql-rl"
 
 # ---------------------------------------------------------------------------
 # MLflow run: log config, train, log artifacts + a quick parse-rate check
 # ---------------------------------------------------------------------------
 mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
 mlflow.set_experiment(MLFLOW_EXPERIMENT)
+
+
+BASE_MODEL_NAME = "Qwen/Qwen3.5-4B"        # or Qwen/Qwen3-1.7B for max speed
+#MODEL_NAME = "Qwen/Qwen3.5-0.8B"
+LORA_R = 32                          # rank; 16-64. 16 is a fine start on 4B
+LORA_ALPHA = 64                     # 2x rank
+
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from peft import PeftModel
+
+model = AutoModelForCausalLM.from_pretrained(
+    BASE_MODEL_NAME, torch_dtype=torch.bfloat16
+).to("xpu")
+model = PeftModel.from_pretrained(model, MODEL)
 
 async def execute_sparql(query):
     """None = failed. set() = ran (may be empty)."""
@@ -84,21 +98,22 @@ ds = ds.map(convert_ds, remove_columns=ds.column_names)
 
 
 trainer = GRPOTrainer(
-    model=MODEL,
+    model=model,
     processing_class=AutoTokenizer.from_pretrained(MODEL),
     reward_funcs=[jena_reward],
     train_dataset=ds,
-    args=GRPOConfig(num_generations=4,
+    args=GRPOConfig(num_generations=8,
                     generation_batch_size=8,
                     per_device_train_batch_size=8,
-                    gradient_accumulation_steps=8,
-                    max_completion_length=256,
-                    learning_rate=3e-6,                     # 1/10th of the LR for SFT.
+                    gradient_accumulation_steps=2,
+                    max_completion_length=384,
+                    #learning_rate=3e-6,                     # 1/10th of the LR for SFT.
+                    learning_rate=1e-5,                     # 1/10th of the LR for SFT.  Higher for LoRA.
                     warmup_steps=20,                         # FIXME: Increase with larger DS.
                     lr_scheduler_type="cosine",
                     bf16=True, fp16=False,
                     optim="adamw_torch_fused",
-                    max_grad_norm=1.,
+                    max_grad_norm=.5,
                     beta=.03,
                     temperature=1.2,
                     report_to="mlflow",
