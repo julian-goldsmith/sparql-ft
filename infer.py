@@ -19,13 +19,13 @@ from validate import strip_reasoning
 # Quick transformers test cell
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-MAX_NEW_TOKENS = 8192  # SPARQL gen default
+MAX_NEW_TOKENS = 2048  # SPARQL gen default
 
 BASE_MODEL_NAME = "Qwen/Qwen3.5-4B"        # or Qwen/Qwen3-1.7B for max speed
 MODEL = "./output/qwen3.5-4b-sparql/checkpoint-292/"
 #MODEL_NAME = "Qwen/Qwen3.5-0.8B"
 LORA_R = 32                          # rank; 16-64. 16 is a fine start on 4B
-LORA_ALPHA = 64                     # 2x rank
+LORA_ALPHA = LORA_R*2                     # 2x rank
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel

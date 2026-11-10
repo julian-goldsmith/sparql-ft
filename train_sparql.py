@@ -39,17 +39,17 @@ from yago_prompts import (YAGO_NS, PREFIXES, KNOWN_NS, SYSTEM_PROMPT,
 # ---------------------------------------------------------------------------
 MODEL_NAME = "Qwen/Qwen3.5-4B"        # or Qwen/Qwen3-1.7B for max speed
 #MODEL_NAME = "Qwen/Qwen3.5-0.8B"
-DATA_PATH = "data/train_sft.jsonl"
+DATA_PATH = "data/train_sft_minr.jsonl"
 OUTPUT_DIR = "output/qwen3.5-4b-sparql"
 EVAL_PATH = "data/eval.jsonl"       # optional, used for post-train parse check
 
-LORA_R = 16                          # rank; 16-64. 16 is a fine start on 4B
+LORA_R = 32                          # rank; 16-64. 16 is a fine start on 4B
 LORA_ALPHA = LORA_R*2                     # 2x rank
-MAX_SEQ_LEN = 2048                   # bump to 4096 if you have the headroom
+MAX_SEQ_LEN = 1024                   # bump to 4096 if you have the headroom
 BATCH_SIZE = 4                      # safe on 32GB; try 4-8
 GRAD_ACCUM = 2                       # effective batch = BATCH_SIZE * GRAD_ACCUM
 EPOCHS = 2
-LR = 3e-5                           # Would be 1e-5ish for full SFT, but LoRA likes larger LRs.
+LR = 1e-4                           # Would be 1e-5ish for full SFT, but LoRA likes larger LRs.
 
 # MLflow
 #MLFLOW_TRACKING_URI = "sqlite:///mlflow.db"   # local, no server needed
